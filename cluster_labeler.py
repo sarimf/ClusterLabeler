@@ -155,9 +155,14 @@ class LabelConfig:
 _GATEWAY: List[Optional[Callable]] = [None]
 
 
-def use_llm(fn: Callable[[List[dict], bool], str]) -> None:
-    """Register the judge gateway once: fn(messages, json_mode=True) -> str (raw model text)."""
+def use_llm(fn: Callable[[List[dict], bool], str]) -> Callable[[List[dict], bool], str]:
+    """Register the judge gateway: fn(messages, json_mode=True) -> str (raw model text).
+
+    Returns fn unchanged so it can be used directly (use_llm(fn)) OR as a
+    decorator (@use_llm) without the decorated name becoming None.
+    """
     _GATEWAY[0] = fn
+    return fn
 
 
 # alias for naming parity with the sibling cluster_judge module (use_genai); same signature.
