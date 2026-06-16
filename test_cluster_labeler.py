@@ -188,8 +188,9 @@ def test_report_blocks_are_grouped_under_concurrency():
                                         progress=False, verbose=0)["billing"]
 
 
-def test_call_bar_counts_llm_calls():
-    # the "llm calls" tqdm bar must tick exactly once per LLM call
+def test_llm_call_count_shown_in_progress_bar():
+    # the running LLM-call count rides in the single progress bar's postfix
+    # (no fragile second bar that spams lines in notebooks)
     if cl.tqdm is None:
         return  # tqdm not installed -> bars disabled, nothing to check
     import io, contextlib
@@ -210,8 +211,9 @@ def test_call_bar_counts_llm_calls():
     finally:
         cl._LLMClient = orig
     c = captured["client"]
-    assert c.call_bar is not None
-    assert c.call_bar.n == c.n_calls > 0
+    assert c.n_calls > 0
+    assert c.progress_bar is not None
+    assert "llm calls" in (c.progress_bar.postfix or "")
 
 
 def test_hanging_gateway_times_out_not_deadlocks():
@@ -257,7 +259,7 @@ if __name__ == "__main__":
     test_input_validation()
     test_failed_cluster_is_isolated()
     test_report_blocks_are_grouped_under_concurrency()
-    test_call_bar_counts_llm_calls()
+    test_llm_call_count_shown_in_progress_bar()
     test_hanging_gateway_times_out_not_deadlocks()
     test_timeout_disabled_passes_through()
     print("all tests passed")
