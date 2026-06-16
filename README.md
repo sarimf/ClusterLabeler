@@ -82,6 +82,14 @@ print(render_label_report(scorecards))
 > connection, no server-side timeout). Each call is bounded by `request_timeout` (default 60s) so a
 > single hung request can't freeze the batch — lower it (e.g. `LabelConfig(request_timeout=20)`)
 > for snappier failure, and/or set a timeout inside `my_llm` itself.
+>
+> **If your gateway already retries/backs off** (e.g. `tenacity`, or the OpenAI client's built-in
+> retries), don't let the two layers fight: a long backoff inside `my_llm` can exceed
+> `request_timeout`, which then cancels the call mid-backoff and looks like a hang. Set
+> **`request_timeout=0`** (rely on your gateway's own per-request timeout) and **`max_retries=0`**
+> (your gateway owns retries), and consider lowering `workers` (e.g. 4–8) so you stop hitting the
+> rate limits that triggered the backoff in the first place. (A timeout is never retried by
+> `cluster_labeler` anyway — it's terminal — but the layers can still waste a lot of wall-clock.)
 
 ### No model handy? Offline mock (testing/demos only)
 
