@@ -10,7 +10,10 @@ import pandas as pd
 
 import cluster_labeler as cl
 from cluster_labeler import (LabelConfig, label_clusters, labels_to_dataframe,
-                             render_label_report, _coerce_fits, _as_bool)
+                             render_label_report, _coerce_fits, _as_bool, _confidence_band)
+
+# every test runs on the offline mock; silence the (expected) "no gateway" warning
+logging.getLogger("cluster_labeler").setLevel(logging.ERROR)
 
 
 def _toy_dataset():
@@ -45,9 +48,38 @@ def test_end_to_end_mock():
     tiny = cards["tiny"]
     assert tiny["scores"]["confidence"] == "unverified"
     assert "too small" in tiny["note"]
-    # dataframe + report render without error
-    assert len(labels_to_dataframe(cards)) == len(themes)
+    # verified clusters expose the full, correctly-named metric set
+    for cid in ("billing", "login", "shipping"):
+        s = cards[cid]["scores"]
+        assert set(s) >= {"recall", "precision", "specificity", "discrimination"}
+    # dataframe + report render without error and carry specificity
+    dfc = labels_to_dataframe(cards)
+    assert len(dfc) == len(themes)
+    assert "specificity" in dfc.columns
     assert "CLUSTER LABELS" in render_label_report(cards)
+
+
+def test_confidence_gating_enforces_recall_and_specificity():
+    cfg = LabelConfig()  # accept_discrimination=.8, accept_recall=.7, accept_precision=.7
+    # high discrimination but poor recall must NOT earn "high"
+    assert _confidence_band(cfg, {"recall": 0.45, "specificity": 0.95, "discrimination": 0.70}, 1.0) != "high"
+    # clears every bar -> high
+    assert _confidence_band(cfg, {"recall": 0.9, "specificity": 0.9, "discrimination": 0.9}, 1.0) == "high"
+    # unstable label is capped below high
+    assert _confidence_band(cfg, {"recall": 0.9, "specificity": 0.9, "discrimination": 0.9}, 0.0) != "high"
+    # no verification at all -> unverified
+    assert _confidence_band(cfg, {"recall": None, "specificity": None, "discrimination": None}, None) == "unverified"
+
+
+def test_single_cluster_flags_recall_only():
+    # one cluster: no siblings, so no negatives -> note must flag recall-only scoring
+    rng = np.random.default_rng(1)
+    df = pd.DataFrame({"text": ["alpha beta gamma"] * 12, "cluster_id": ["only"] * 12})
+    emb = rng.normal(size=(12, 8)).astype(np.float32)
+    cards = label_clusters(df, embeddings=emb, progress=False)
+    sc = cards["only"]
+    assert sc["scores"]["specificity"] is None
+    assert sc["note"] and "recall-only" in sc["note"]
 
 
 def test_fits_coercion():
@@ -102,6 +134,8 @@ def test_failed_cluster_is_isolated():
 if __name__ == "__main__":
     test_end_to_end_mock()
     test_fits_coercion()
+    test_confidence_gating_enforces_recall_and_specificity()
+    test_single_cluster_flags_recall_only()
     test_input_validation()
     test_failed_cluster_is_isolated()
     print("all tests passed")

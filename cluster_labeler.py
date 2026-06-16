@@ -15,8 +15,9 @@ Why this is not "summarize the centroid neighbours":
                     descriptive).
     3. VERIFY     - score each candidate as a classifier on HELD-OUT items never
                     shown during evidence/proposal: recall (held-out members
-                    accepted), precision (held-out sibling items rejected),
-                    discrimination (balanced accuracy of the two).
+                    accepted), specificity (held-out sibling items rejected),
+                    precision (of items it accepts, share that are true members),
+                    discrimination (balanced accuracy of recall + specificity).
     4. REFINE     - feed the best candidate's false negatives/positives back and
                     ask for a revision; repeat until it clears a bar or the
                     iteration budget runs out.
@@ -53,7 +54,8 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger("cluster_labeler")
 
-__all__ = ["LabelConfig", "use_llm", "label_clusters", "labels_to_dataframe", "render_label_report"]
+__all__ = ["LabelConfig", "use_llm", "use_genai", "label_clusters", "labels_to_dataframe",
+           "render_label_report"]
 
 
 # ===========================================================================
@@ -116,6 +118,10 @@ _GATEWAY: List[Optional[Callable]] = [None]
 def use_llm(fn: Callable[[List[dict], bool], str]) -> None:
     """Register the judge gateway once: fn(messages, json_mode=True) -> str (raw model text)."""
     _GATEWAY[0] = fn
+
+
+# alias for naming parity with the sibling cluster_judge module (use_genai); same signature.
+use_genai = use_llm
 
 
 # ===========================================================================
@@ -209,6 +215,12 @@ class _LLMClient:
         self.cfg = cfg
         self.fn = llm_fn
         self.mock = llm_fn is None
+        if self.mock:
+            # the mock is an extractive word-overlap heuristic, not a real labeler.
+            # Falling back to it silently is a production footgun, so say so loudly.
+            log.warning("cluster_labeler: NO LLM gateway registered — using the offline MOCK "
+                        "labeler (word-overlap heuristic, NOT model quality). Register a real "
+                        "model via use_llm()/use_genai() or pass llm_fn= for real labels.")
         self.n_calls = 0
         self.n_empty = 0
         self._lock = threading.Lock()
@@ -232,16 +244,20 @@ class _LLMClient:
         msgs = [{"role": "system", "content": "You are a careful analyst. Reply with STRICT JSON only."},
                 {"role": "user", "content": prompt}]
         delay = self.cfg.backoff_base
-        for att in range(self.cfg.max_retries + 1):
+        attempts = self.cfg.max_retries + 1
+        for att in range(attempts):
             try:
                 v = _parse_json(self.fn(msgs, json_mode=True))
                 if v:
                     return v
+                # parse/empty failures used to be swallowed silently
+                log.warning("LLM returned unparseable/empty JSON (%s), attempt %d/%d",
+                            mock_kind, att + 1, attempts)
             except Exception as e:
-                if att == self.cfg.max_retries:
-                    log.warning("LLM call failed after retries (%s): %s", mock_kind, e)
-            time.sleep(delay)
-            delay *= 2
+                log.warning("LLM call error (%s), attempt %d/%d: %s", mock_kind, att + 1, attempts, e)
+            if att < attempts - 1:        # don't sleep after the final attempt
+                time.sleep(delay)
+                delay *= 2
         with self._lock:
             self.n_empty += 1
         return {}
@@ -453,40 +469,52 @@ def _redifferentiate_prompt(cfg: LabelConfig, a_label, a_desc, a_items, b_label,
 # ===========================================================================
 # stage 2/3: verification + refinement
 # ===========================================================================
-# NOTE on the "precision" score: it is the sibling-REJECTION rate
-# (true negatives / negatives), i.e. specificity, not text-book precision
-# TP/(TP+FP). "discrimination" is the balanced accuracy of recall+specificity.
+_NO_METRICS = {"recall": None, "precision": None, "specificity": None, "discrimination": None}
+
+
+def _disc(metrics: dict) -> float:
+    return metrics.get("discrimination") or 0.0
+
+
 def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str],
-                     neg_texts: List[str]) -> Tuple[Optional[float], Optional[float], Optional[float], List[bool]]:
+                     neg_texts: List[str]) -> Tuple[dict, List[bool]]:
+    """Grade a candidate as a classifier over held-out positives + sibling negatives.
+
+    Returns a metrics dict and the per-item verdicts. The metrics are reported
+    under their correct statistical names:
+      recall        = held-out members accepted          TP / (TP+FN)
+      precision     = of items it accepts, share correct TP / (TP+FP)
+      specificity   = sibling items correctly rejected   TN / (TN+FP)
+      discrimination= balanced accuracy of recall+specificity
+    """
     cfg = ctx.cfg
+    none_metrics = {"recall": None, "precision": None, "specificity": None, "discrimination": None}
     items = pos_texts + neg_texts
     if not items:
-        return 0.0, 0.0, 0.0, []
+        return none_metrics, []
     res = ctx.client.complete(
         _verify_prompt(cfg, cand["label"], cand.get("description", ""), items),
         "verify", {"label": cand["label"], "description": cand.get("description", ""), "items": items})
     fits = _coerce_fits(res.get("fits"), len(items))
     n_pos, n_neg = len(pos_texts), len(neg_texts)
-    recall = sum(1 for f in fits[:n_pos] if f) / n_pos if n_pos else None
-    precision_neg_reject = sum(1 for f in fits[n_pos:] if not f) / n_neg if n_neg else None
-    if recall is None:
-        discrimination = precision_neg_reject
-    elif precision_neg_reject is None:
-        discrimination = recall
-    else:
-        discrimination = (recall + precision_neg_reject) / 2
-    return recall, precision_neg_reject, discrimination, fits
+    tp = sum(1 for f in fits[:n_pos] if f)
+    fp = sum(1 for f in fits[n_pos:] if f)
+    recall = tp / n_pos if n_pos else None
+    specificity = (n_neg - fp) / n_neg if n_neg else None
+    precision = tp / (tp + fp) if (tp + fp) else None      # undefined when nothing is accepted
+    parts = [m for m in (recall, specificity) if m is not None]
+    discrimination = sum(parts) / len(parts) if parts else None
+    return {"recall": recall, "precision": precision,
+            "specificity": specificity, "discrimination": discrimination}, fits
 
 
 def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int],
-                 neg_texts: List[str], neg_ids: List[int]) -> Tuple[dict, float, float, float]:
+                 neg_texts: List[str], neg_ids: List[int]) -> Tuple[dict, dict]:
     cfg = ctx.cfg
-    recall, precision, disc, fits = _grade_candidate(ctx, cand, pos_texts, neg_texts)
-    best = (cand, recall or 0.0, precision or 0.0, disc or 0.0)
-    best_fits = fits
+    best_cand, best_metrics, best_fits = cand, *_grade_candidate(ctx, cand, pos_texts, neg_texts)
     n_pos = len(pos_texts)
     for _ in range(cfg.refine_max_iters):
-        if best[3] >= cfg.accept_discrimination:
+        if _disc(best_metrics) >= cfg.accept_discrimination:
             break
         # reuse the verdicts from the grading we already paid for instead of
         # re-running verify on the same items (halves the calls per iteration
@@ -496,19 +524,18 @@ def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int]
         if not false_neg and not false_pos:
             break
         rev = ctx.client.complete(
-            _refine_prompt(cfg, best[0]["label"], best[0].get("description", ""), false_neg, false_pos),
-            "refine", {"label": best[0]["label"], "description": best[0].get("description", "")})
+            _refine_prompt(cfg, best_cand["label"], best_cand.get("description", ""), false_neg, false_pos),
+            "refine", {"label": best_cand["label"], "description": best_cand.get("description", "")})
         if not rev.get("label"):
             break
         new_cand = {"label": rev["label"], "description": rev.get("description", ""),
-                    "rationale": rev.get("rationale", best[0].get("rationale", ""))}
-        r2, p2, d2, f2 = _grade_candidate(ctx, new_cand, pos_texts, neg_texts)
-        if (d2 or 0.0) >= best[3]:
-            best = (new_cand, r2 or 0.0, p2 or 0.0, d2 or 0.0)
-            best_fits = f2
+                    "rationale": rev.get("rationale", best_cand.get("rationale", ""))}
+        m2, f2 = _grade_candidate(ctx, new_cand, pos_texts, neg_texts)
+        if _disc(m2) >= _disc(best_metrics):
+            best_cand, best_metrics, best_fits = new_cand, m2, f2
         else:
             break
-    return best
+    return best_cand, best_metrics
 
 
 # ===========================================================================
@@ -580,7 +607,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
                                   "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
         cands = res.get("candidates") or []
         cand = cands[0] if cands else {"label": cid, "description": "", "rationale": ""}
-        return _finalize(ctx, cid, cand, n, recall=None, precision=None, discrimination=None,
+        return _finalize(ctx, cid, cand, n, metrics=dict(_NO_METRICS),
                          stability=None, evidence=ev, alternatives=[], subthemes=None,
                          note="cluster too small for held-out verification",
                          n_calls=ctx.client.calls_since_reset())
@@ -605,32 +632,46 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
 
     graded = []
     for cand in candidates:
-        best_cand, recall, precision, disc = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids)
-        graded.append((best_cand, recall, precision, disc))
-    graded.sort(key=lambda g: -g[3])
-    best_cand, recall, precision, discrimination = graded[0]
+        best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids)
+        graded.append((best_cand, metrics))
+    graded.sort(key=lambda g: -_disc(g[1]))
+    best_cand, best_metrics = graded[0]
     alternatives = [{"label": g[0]["label"], "description": g[0].get("description", ""),
-                     "discrimination": g[3]} for g in graded[1:]]
+                     "discrimination": g[1].get("discrimination")} for g in graded[1:]]
 
     stability = _stability_score(ctx, code, train, best_cand["label"], rng)
     subthemes = _maybe_subthemes(ctx, idxs, ev["spread_ratio"], rng)
 
-    return _finalize(ctx, cid, best_cand, n, recall=recall, precision=precision, discrimination=discrimination,
+    # When a cluster has no siblings (K == 1) there are no negatives, so precision
+    # and specificity are unmeasured and discrimination is recall-only — flag it
+    # rather than let a recall-only score masquerade as full discrimination.
+    note = None if neg_texts else ("no sibling negatives: precision/specificity unmeasured, "
+                                   "discrimination is recall-only")
+
+    return _finalize(ctx, cid, best_cand, n, metrics=best_metrics,
                      stability=stability, evidence=ev, alternatives=alternatives, subthemes=subthemes,
-                     note=None, n_calls=ctx.client.calls_since_reset())
+                     note=note, n_calls=ctx.client.calls_since_reset())
 
 
-def _confidence_band(cfg: LabelConfig, discrimination: Optional[float], stability: Optional[float]) -> str:
-    if discrimination is None:
+def _confidence_band(cfg: LabelConfig, metrics: dict, stability: Optional[float]) -> str:
+    disc = metrics.get("discrimination")
+    if disc is None:
         return "unverified"
-    if discrimination >= cfg.accept_discrimination and (stability is None or stability >= cfg.stability_min_jaccard):
+    recall, spec = metrics.get("recall"), metrics.get("specificity")
+    stable = stability is None or stability >= cfg.stability_min_jaccard
+    # "high" must clear every bar the config advertises, not discrimination alone:
+    # a recall-0.45 / specificity-0.95 label scores discrimination 0.70 but misses
+    # half its members, so accept_recall/accept_precision are enforced here too.
+    recall_ok = recall is None or recall >= cfg.accept_recall
+    spec_ok = spec is None or spec >= cfg.accept_precision
+    if disc >= cfg.accept_discrimination and recall_ok and spec_ok and stable:
         return "high"
-    if discrimination >= 0.6:
+    if disc >= 0.6:
         return "medium"
     return "low"
 
 
-def _finalize(ctx: _Ctx, cid, cand, size, *, recall, precision, discrimination, stability, evidence,
+def _finalize(ctx: _Ctx, cid, cand, size, *, metrics, stability, evidence,
              alternatives, subthemes, note, n_calls) -> dict:
     cfg = ctx.cfg
     ev_block: Dict[str, Any] = {}
@@ -643,12 +684,13 @@ def _finalize(ctx: _Ctx, cid, cand, size, *, recall, precision, discrimination, 
     return {
         "cluster_id": cid,
         "label": cand.get("label", cid),
-        "description": cand.get("description", ""),
+        "description": _clip(cand.get("description", ""), cfg.desc_chars),
         "rationale": cand.get("rationale", ""),
         "size": size,
         "scores": {
-            "recall": recall, "precision": precision, "discrimination": discrimination,
-            "stability": stability, "confidence": _confidence_band(cfg, discrimination, stability),
+            "recall": metrics.get("recall"), "precision": metrics.get("precision"),
+            "specificity": metrics.get("specificity"), "discrimination": metrics.get("discrimination"),
+            "stability": stability, "confidence": _confidence_band(cfg, metrics, stability),
         },
         "alternatives": alternatives,
         "confusable_with": [],
@@ -664,8 +706,8 @@ def _error_card(cid: str, size: int, err: str) -> dict:
     breaks the downstream coherence pass / dataframe / report."""
     return {
         "cluster_id": cid, "label": cid, "description": "", "rationale": "", "size": size,
-        "scores": {"recall": None, "precision": None, "discrimination": None,
-                   "stability": None, "confidence": "error"},
+        "scores": {"recall": None, "precision": None, "specificity": None,
+                   "discrimination": None, "stability": None, "confidence": "error"},
         "alternatives": [], "confusable_with": [], "subthemes": None,
         "evidence": {"core": [], "core_texts": [], "diverse": [], "diverse_texts": [],
                      "boundary": [], "boundary_texts": []},
@@ -682,15 +724,13 @@ def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[
     code_of = {c: i for i, c in cid_of.items()}
     sims = ctx.cent @ ctx.cent.T
     n = len(cids)
-    redone = set()
     for i in range(n):
-        for j in range(i + 1, n):
+        for j in range(i + 1, n):  # each unordered pair is visited exactly once
             a_cid, b_cid = cids[i], cids[j]
             a, b = scorecards[a_cid], scorecards[b_cid]
             cent_sim = float(sims[i, j])
             label_sim = _jaccard(a["label"], b["label"])
-            if label_sim >= cfg.dedup_label_jaccard and cent_sim < cfg.dedup_cent_sim and \
-               (a_cid, b_cid) not in redone:
+            if label_sim >= cfg.dedup_label_jaccard and cent_sim < cfg.dedup_cent_sim:
                 a_idxs = ctx.idxs_by_code[code_of[a_cid]]
                 b_idxs = ctx.idxs_by_code[code_of[b_cid]]
                 a_items = [_clip(ctx.text_arr[k], cfg.item_chars) for k in a_idxs[: cfg.n_core]]
@@ -704,7 +744,6 @@ def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[
                     a["label"], a["description"] = res["a"]["label"], res["a"].get("description", a["description"])
                 if res.get("b", {}).get("label"):
                     b["label"], b["description"] = res["b"]["label"], res["b"].get("description", b["description"])
-                redone.add((a_cid, b_cid))
             elif cent_sim >= cfg.dedup_cent_sim and label_sim < cfg.dedup_label_jaccard:
                 a.setdefault("confusable_with", []).append({"cluster_id": b_cid, "label": b["label"],
                                                             "cent_similarity": round(cent_sim, 3)})
@@ -742,8 +781,15 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
             raise ValueError("pass `embeddings` or `embedding_col`")
         if embedding_col not in df.columns:
             raise KeyError(f"embedding_col {embedding_col!r} not found in DataFrame")
-        embeddings = np.stack(df[embedding_col].to_numpy())
-    embeddings = np.asarray(embeddings, dtype=np.float32)
+        try:
+            embeddings = np.vstack(df[embedding_col].to_list())
+        except Exception as e:  # ragged / non-array cells give a cryptic numpy error otherwise
+            raise ValueError(f"could not stack embedding_col {embedding_col!r} into a matrix "
+                             f"(rows must be equal-length vectors): {e}") from e
+    try:
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"embeddings could not be read as a float array: {e}") from e
     if embeddings.ndim != 2 or embeddings.shape[0] != len(df):
         raise ValueError(f"embeddings must be 2-D aligned to df: got shape {embeddings.shape} "
                          f"for {len(df)} rows")
@@ -798,8 +844,9 @@ def labels_to_dataframe(scorecards: Dict[str, dict]) -> pd.DataFrame:
         sco = sc["scores"]
         rows.append({"cluster_id": cid, "label": sc["label"], "description": sc["description"],
                      "size": sc["size"], "recall": sco["recall"], "precision": sco["precision"],
-                     "discrimination": sco["discrimination"], "stability": sco["stability"],
-                     "confidence": sco["confidence"], "n_subthemes": len(sc["subthemes"] or []),
+                     "specificity": sco.get("specificity"), "discrimination": sco["discrimination"],
+                     "stability": sco["stability"], "confidence": sco["confidence"],
+                     "n_subthemes": len(sc["subthemes"] or []),
                      "n_confusable": len(sc["confusable_with"]), "note": sc["note"]})
     return pd.DataFrame(rows)
 
