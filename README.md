@@ -274,6 +274,7 @@ stability, confidence, n_subthemes, n_confusable, note`.
 |---|---|---|
 | `holdout_frac` | `0.3` | Fraction of a cluster's members held out for grading (never shown to evidence/proposal/refine). |
 | `min_holdout` | `4` | Minimum held-out members (when the cluster is large enough). |
+| `verify_positives` | `12` | Held-out members **sampled** into each verify prompt. Caps prompt size on big clusters (the full holdout can be thousands of items); raise for a tighter recall estimate, lower for cheaper/faster calls. |
 | `verify_negatives` | `8` | Held-out sibling items used as negatives during grading. |
 
 ### Candidate generation & acceptance

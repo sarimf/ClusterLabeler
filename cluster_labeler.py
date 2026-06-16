@@ -111,6 +111,9 @@ class LabelConfig:
     # held-out verification (classifier-style grading, never seen by evidence/proposal)
     holdout_frac: float = 0.3
     min_holdout: int = 4
+    verify_positives: int = 12               # held-out members sampled into a verify prompt.
+                                             # Caps prompt size on big clusters — without this a
+                                             # large cluster sends thousands of items per call.
     verify_negatives: int = 8                # held-out sibling items used as negatives
 
     # candidate generation / refinement
@@ -796,13 +799,22 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     say(f"  · proposed {len(candidates)} candidate(s): "
         f"{', '.join(repr(c.get('label', '')) for c in candidates[:4])}")
 
-    pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in holdout]
+    # Grade on a CAPPED sample of held-out members. The full holdout can be ~30%
+    # of a huge cluster (thousands of items); sending all of them in one verify
+    # prompt is what makes large clusters time out (and truncated 'fits' arrays
+    # corrupt recall). The whole holdout is still excluded from evidence/proposal.
+    pos_pool = holdout
+    if len(pos_pool) > cfg.verify_positives:
+        pos_pool = rng.choice(pos_pool, size=cfg.verify_positives, replace=False)
+    pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in pos_pool]
     neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng,
                                            exclude=set(shown_neighbour_ids))
+    say(f"  · verifying on {len(pos_texts)} held-out members + {len(neg_texts)} sibling negatives "
+        f"(of {len(holdout)} held out)")
 
     graded = []
     for cand in candidates:
-        best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids, rng)
+        best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(pos_pool), neg_texts, neg_ids, rng)
         graded.append((best_cand, metrics))
         say(f"  · graded {best_cand.get('label', '')!r}: "
             f"disc={_fmt_score(metrics.get('discrimination'))} "

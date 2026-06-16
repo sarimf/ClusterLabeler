@@ -16,6 +16,38 @@ from cluster_labeler import (LabelConfig, label_clusters, labels_to_dataframe,
 logging.getLogger("cluster_labeler").setLevel(logging.ERROR)
 
 
+def test_verify_positives_capped_on_large_clusters():
+    # a large cluster must NOT send its whole holdout (~30% of the cluster) into a
+    # verify prompt — that's what makes big clusters time out. Cap at verify_positives.
+    rng = np.random.default_rng(0)
+    n_big, n_other = 300, 60
+    df = pd.DataFrame({
+        "text": [f"alpha beta gamma item{i}" for i in range(n_big)] +
+                [f"delta epsilon zeta item{i}" for i in range(n_other)],
+        "cluster_id": ["big"] * n_big + ["other"] * n_other,
+    })
+    emb = np.vstack([
+        rng.normal(0, 0.1, (n_big, 8)) + np.array([5.] + [0.] * 7),
+        rng.normal(0, 0.1, (n_other, 8)) + np.array([-5.] + [0.] * 7),
+    ]).astype(np.float32)
+
+    seen = {"max_pos": 0}
+    orig = cl._grade_candidate
+
+    def spy(ctx, cand, pos_texts, neg_texts, rng):
+        seen["max_pos"] = max(seen["max_pos"], len(pos_texts))
+        return orig(ctx, cand, pos_texts, neg_texts, rng)
+
+    cl._grade_candidate = spy
+    try:
+        cl.label_clusters(df, embeddings=emb,
+                          cfg=LabelConfig(allow_mock=True, verify_positives=12, workers=2),
+                          progress=False, verbose=0)
+    finally:
+        cl._grade_candidate = orig
+    assert 0 < seen["max_pos"] <= 12, f"verify prompt used {seen['max_pos']} positives (cap 12)"
+
+
 def test_use_llm_is_decorator_friendly():
     # use_llm / use_genai must return the function so @use_llm doesn't rebind the
     # decorated name to None, and must register it as the gateway.
@@ -288,6 +320,7 @@ def test_timeout_disabled_passes_through():
 
 if __name__ == "__main__":
     test_use_llm_is_decorator_friendly()
+    test_verify_positives_capped_on_large_clusters()
     test_end_to_end_mock()
     test_fits_coercion()
     test_confidence_gating_enforces_recall_and_specificity()
