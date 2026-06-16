@@ -16,6 +16,23 @@ from cluster_labeler import (LabelConfig, label_clusters, labels_to_dataframe,
 logging.getLogger("cluster_labeler").setLevel(logging.ERROR)
 
 
+def test_use_llm_is_decorator_friendly():
+    # use_llm / use_genai must return the function so @use_llm doesn't rebind the
+    # decorated name to None, and must register it as the gateway.
+    from cluster_labeler import use_llm, use_genai, _GATEWAY
+    saved = _GATEWAY[0]
+    try:
+        @use_llm
+        def gw(messages, json_mode=True):
+            return "{}"
+        assert gw is not None and callable(gw)        # name not clobbered to None
+        assert gw(messages=[], json_mode=True) == "{}"  # still the real function
+        assert _GATEWAY[0] is gw                        # registered as the gateway
+        assert use_llm(gw) is gw and use_genai(gw) is gw
+    finally:
+        _GATEWAY[0] = saved
+
+
 def _toy_dataset():
     rng = np.random.default_rng(0)
     themes = {
@@ -249,6 +266,7 @@ def test_timeout_disabled_passes_through():
 
 
 if __name__ == "__main__":
+    test_use_llm_is_decorator_friendly()
     test_end_to_end_mock()
     test_fits_coercion()
     test_confidence_gating_enforces_recall_and_specificity()

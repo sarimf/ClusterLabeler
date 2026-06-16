@@ -68,7 +68,7 @@ def my_llm(messages, json_mode=True):
     )
     return resp.choices[0].message.content
 
-use_llm(my_llm)
+use_llm(my_llm)            # or as a decorator: @use_llm above `def my_llm(...)`
 
 # 3. label every cluster
 scorecards = label_clusters(df, embeddings=embeddings)
