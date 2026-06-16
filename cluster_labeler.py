@@ -380,6 +380,16 @@ class _LLMClient:
                 # parse/empty failures used to be swallowed silently
                 log.warning("LLM returned unparseable/empty JSON (%s), attempt %d/%d",
                             mock_kind, att + 1, attempts)
+            except TimeoutError:
+                # A timeout means the call is STILL RUNNING in the background.
+                # Retrying would spawn a duplicate, and if the gateway does its
+                # own retries/backoff (e.g. tenacity) the duplicates multiply
+                # into a storm. So a timeout is terminal for this call.
+                log.warning("LLM call timed out (%s) after %ss — giving up this call. If your "
+                            "gateway already retries/backs off, set request_timeout=0 and "
+                            "max_retries=0 so the two layers don't fight.",
+                            mock_kind, self.cfg.request_timeout)
+                break
             except Exception as e:
                 log.warning("LLM call error (%s), attempt %d/%d: %s", mock_kind, att + 1, attempts, e)
             if att < attempts - 1:        # don't sleep after the final attempt

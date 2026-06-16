@@ -253,6 +253,27 @@ def test_hanging_gateway_times_out_not_deadlocks():
     assert set(cards) == {"alpha", "beta"}      # both clusters still produced cards
 
 
+def test_timeout_is_terminal_no_retry_storm():
+    # a timed-out call must NOT be retried (the call is still running; retrying
+    # spawns duplicates and, with a retrying gateway, a storm). The gateway
+    # should be invoked exactly once despite max_retries=3.
+    import time
+    from cluster_labeler import _LLMClient
+    calls = []
+
+    def hanging(messages, json_mode=True):
+        calls.append(1)
+        time.sleep(30)
+        return "{}"
+
+    client = _LLMClient(LabelConfig(request_timeout=0.2, max_retries=3), hanging)
+    t0 = time.time()
+    res = client.complete("p", "propose", {})
+    assert res == {}
+    assert time.time() - t0 < 5            # ~one 0.2s timeout, not 4 × (0.2 + backoff)
+    assert len(calls) == 1                  # terminal: invoked once, no storm
+
+
 def test_timeout_disabled_passes_through():
     from cluster_labeler import _call_with_timeout
     assert _call_with_timeout(lambda: 42, None) == 42
@@ -279,5 +300,6 @@ if __name__ == "__main__":
     test_report_blocks_are_grouped_under_concurrency()
     test_llm_call_count_shown_in_progress_bar()
     test_hanging_gateway_times_out_not_deadlocks()
+    test_timeout_is_terminal_no_retry_storm()
     test_timeout_disabled_passes_through()
     print("all tests passed")
