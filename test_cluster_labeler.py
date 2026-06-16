@@ -166,6 +166,86 @@ def test_failed_cluster_is_isolated():
     assert "failed" in cards["login"]["note"]
 
 
+def test_report_blocks_are_grouped_under_concurrency():
+    # With multiple workers, each cluster's buffered stage lines must flush as one
+    # contiguous block right after its header — never interleaved with other clusters.
+    import io, re, contextlib
+    df, emb, themes = _toy_dataset()
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True, workers=4),
+                       progress=False, verbose=2)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    header = re.compile(r"^\S+ \[\d+/\d+\] \[")            # "<glyph> [i/N] [cid] ..."
+    header_idx = [i for i, ln in enumerate(lines) if header.match(ln)]
+    assert len(header_idx) == len(themes)                  # one header per cluster
+    # the first detail line of every cluster ("· start") must immediately follow its header,
+    # which only holds if the block was emitted atomically (no interleaving)
+    for i in header_idx:
+        assert lines[i + 1].lstrip().startswith("· start"), lines[i + 1]
+    # and the returned cards must not carry the internal buffer
+    assert "_log" not in label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True),
+                                        progress=False, verbose=0)["billing"]
+
+
+def test_call_bar_counts_llm_calls():
+    # the "llm calls" tqdm bar must tick exactly once per LLM call
+    if cl.tqdm is None:
+        return  # tqdm not installed -> bars disabled, nothing to check
+    import io, contextlib
+    df, emb, _ = _toy_dataset()
+    captured = {}
+    orig = cl._LLMClient
+
+    class Probe(cl._LLMClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            captured["client"] = self
+
+    cl._LLMClient = Probe
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):  # swallow the bar rendering
+            cl.label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True, workers=4),
+                              progress=True, verbose=0)
+    finally:
+        cl._LLMClient = orig
+    c = captured["client"]
+    assert c.call_bar is not None
+    assert c.call_bar.n == c.n_calls > 0
+
+
+def test_hanging_gateway_times_out_not_deadlocks():
+    # A stalled gateway call must NOT hang the whole batch: request_timeout bounds
+    # each call so label_clusters still returns (with fallback labels).
+    import time
+    df = pd.DataFrame({"text": ["alpha beta gamma"] * 4 + ["delta epsilon zeta"] * 4,
+                       "cluster_id": ["alpha"] * 4 + ["beta"] * 4})
+    emb = np.random.default_rng(0).normal(size=(8, 8)).astype(np.float32)
+
+    def hanging_gateway(messages, json_mode=True):
+        time.sleep(30)            # simulate a network request that never returns in time
+        return "{}"
+
+    cfg = LabelConfig(request_timeout=0.2, max_retries=0, workers=4)
+    t0 = time.time()
+    cards = label_clusters(df, embeddings=emb, llm_fn=hanging_gateway, cfg=cfg,
+                           progress=False, verbose=0)
+    assert time.time() - t0 < 10, "batch hung instead of timing out the stalled gateway"
+    assert set(cards) == {"alpha", "beta"}      # both clusters still produced cards
+
+
+def test_timeout_disabled_passes_through():
+    from cluster_labeler import _call_with_timeout
+    assert _call_with_timeout(lambda: 42, None) == 42
+    assert _call_with_timeout(lambda: 42, 0) == 42
+    assert _call_with_timeout(lambda: 42, 5) == 42
+    try:
+        _call_with_timeout(lambda: (_ for _ in ()).throw(ValueError("boom")), 5)
+        raise AssertionError("expected the gateway error to propagate")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     test_end_to_end_mock()
     test_fits_coercion()
@@ -176,4 +256,8 @@ if __name__ == "__main__":
     test_requires_gateway_unless_allow_mock()
     test_input_validation()
     test_failed_cluster_is_isolated()
+    test_report_blocks_are_grouped_under_concurrency()
+    test_call_bar_counts_llm_calls()
+    test_hanging_gateway_times_out_not_deadlocks()
+    test_timeout_disabled_passes_through()
     print("all tests passed")

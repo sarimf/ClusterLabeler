@@ -77,6 +77,11 @@ print(render_label_report(scorecards))
 
 > The gateway is called from multiple worker threads concurrently — make sure `my_llm` (and any
 > client it wraps) is thread-safe, or lower `workers` (see below).
+>
+> **If a run seems to hang:** it's almost always a stalled gateway call (rate-limit, dropped
+> connection, no server-side timeout). Each call is bounded by `request_timeout` (default 60s) so a
+> single hung request can't freeze the batch — lower it (e.g. `LabelConfig(request_timeout=20)`)
+> for snappier failure, and/or set a timeout inside `my_llm` itself.
 
 ### No model handy? Offline mock (testing/demos only)
 
@@ -178,6 +183,27 @@ cluster_labeler: done — 4 clusters in 18.3s, 612 LLM calls (3 empty)
 - `verbose=1` — banner + per-cluster result + coherence flags + summary (default).
 - `verbose=2` — also per-stage detail inside each cluster (evidence shape, candidates proposed,
   each candidate's grades, sub-themes).
+
+Even though clusters are labeled in parallel (`workers`), each cluster's lines are **buffered and
+flushed as one block** when it finishes, so the output stays grouped and readable instead of
+interleaving across workers.
+
+### Progress bars
+
+With `tqdm` installed and `progress=True` (default), two live bars are shown:
+
+```text
+labeling:  75%|███████▌  | 3/4 [00:12<00:04, cluster/s]
+llm calls: 612call [00:12, 49.7call/s]
+```
+
+- **labeling** — clusters finished out of the total (determinate).
+- **llm calls** — a running count of LLM calls made, with a calls/sec rate. It's a count-up bar
+  (no fixed total) because the number of calls isn't known ahead of time — it depends on how many
+  candidates are proposed, how often refinement runs, stability resamples, sub-themes, and the
+  coherence pass. Handy for spotting a stalled gateway (the rate drops to zero).
+
+Bars are independent of `verbose`; set `progress=False` to disable them.
 
 Every message is also sent to the `cluster_labeler` logger, so apps that configure logging can
 capture or route it; set `verbose=0` and use logging if you prefer.
@@ -286,6 +312,7 @@ stability, confidence, n_subthemes, n_confusable, note`.
 | `workers` | `16` | Thread-pool size. Your `llm_fn` must be thread-safe; lower this if not. |
 | `max_retries` | `3` | Retries per LLM call on error/unparseable output (exponential backoff). |
 | `backoff_base` | `0.5` | Initial backoff seconds between retries (doubles each retry). |
+| `request_timeout` | `60.0` | Seconds to wait for each gateway call before giving up (then retried). Bounds a stalled request so one hung call can't hang the whole batch. `0`/`None` disables. |
 | `allow_mock` | `False` | Must be `True` to run the offline mock when no gateway is registered. |
 
 > **Note:** `model` and `temperature` are stored on the config but not currently passed into the

@@ -139,6 +139,9 @@ class LabelConfig:
     workers: int = 16
     max_retries: int = 3
     backoff_base: float = 0.5
+    request_timeout: float = 60.0            # seconds per LLM call; 0/None disables.
+                                             # Bounds a stalled gateway so one hung
+                                             # network request can't hang the whole batch.
 
     # offline mock labeler is OPT-IN: label_clusters refuses to run without a
     # registered gateway / llm_fn unless this is explicitly set true. Prevents a
@@ -267,6 +270,32 @@ def _fits_of(res: Any, n: int) -> List[bool]:
     return _coerce_fits(raw, n)
 
 
+def _call_with_timeout(fn: Callable[[], Any], timeout: Optional[float]) -> Any:
+    """Run fn() but stop waiting after `timeout` seconds. A user gateway is an
+    arbitrary (usually blocking network) call; without a bound, one stalled
+    request hangs its worker forever and the whole batch never completes. The
+    call runs on a daemon thread, so on timeout we abandon it (it cannot block
+    interpreter exit) and raise TimeoutError, which the retry loop handles."""
+    if not timeout or timeout <= 0:
+        return fn()
+    box: Dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["v"] = fn()
+        except BaseException as e:  # propagate the gateway's own error to the caller
+            box["e"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"LLM call exceeded {timeout:g}s")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
 # ===========================================================================
 # LLM client (mock fallback = cheap extractive contrast, no network needed)
 # ===========================================================================
@@ -284,6 +313,8 @@ class _LLMClient:
         self.n_calls = 0
         self.n_empty = 0
         self._lock = threading.Lock()
+        # optional tqdm bar that ticks once per LLM call (set by label_clusters).
+        self.call_bar = None
         # per-thread call counter: each cluster is labeled start-to-finish on a
         # single worker thread, so a thread-local count is the only correct way
         # to attribute LLM calls to a cluster when workers run concurrently.
@@ -298,6 +329,8 @@ class _LLMClient:
     def complete(self, prompt: str, mock_kind: str, mock_ctx: dict) -> dict:
         with self._lock:
             self.n_calls += 1
+            if self.call_bar is not None:    # live count of LLM calls (thread-safe under the lock)
+                self.call_bar.update(1)
         self._local.count = getattr(self._local, "count", 0) + 1
         if self.mock:
             return _mock_response(mock_kind, mock_ctx)
@@ -307,7 +340,9 @@ class _LLMClient:
         attempts = self.cfg.max_retries + 1
         for att in range(attempts):
             try:
-                v = _parse_json(self.fn(msgs, json_mode=True))
+                raw = _call_with_timeout(lambda: self.fn(msgs, json_mode=True),
+                                         self.cfg.request_timeout)
+                v = _parse_json(raw)
                 if v:
                     return v
                 # parse/empty failures used to be swallowed silently
@@ -675,21 +710,30 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     n = len(idxs)
     rng = np.random.default_rng([cfg.seed, code])
     ctx.client.reset_call_counter()
-    ctx.report(f"  · [{cid}] start (size {n})", level=2)
+    # Buffer this worker's stage messages and attach them to the returned card.
+    # With concurrent workers, printing live interleaves clusters; the caller
+    # flushes each cluster's lines as one atomic block when it finishes.
+    log_lines: List[Tuple[int, str]] = []
+    def say(msg: str, level: int = 2) -> None:
+        log_lines.append((level, msg))
+
+    say(f"  · start (size {n})")
 
     if n < cfg.min_cluster_size:
         ev = _build_evidence(code, idxs, ctx, rng)
         target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
         neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
-        ctx.report(f"  · [{cid}] small cluster — labeling from all {n} members, no held-out check", level=2)
+        say(f"  · small cluster — labeling from all {n} members, no held-out check")
         res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, 1),
                                   "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
         cands = _candidates_of(res)
         cand = cands[0] if cands else {"label": cid, "description": "", "rationale": ""}
-        return _finalize(ctx, cid, cand, n, metrics=dict(_NO_METRICS),
+        card = _finalize(ctx, cid, cand, n, metrics=dict(_NO_METRICS),
                          stability=None, evidence=ev, alternatives=[], subthemes=None,
                          note="cluster too small for held-out verification",
                          n_calls=ctx.client.calls_since_reset())
+        card["_log"] = log_lines
+        return card
 
     # held-out split: never shown to evidence/proposal/refine
     perm = rng.permutation(idxs)
@@ -699,16 +743,16 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     ev = _build_evidence(code, train, ctx, rng)
     target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
     neighbour_texts, shown_neighbour_ids = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
-    ctx.report(f"  · [{cid}] evidence: {len(ev['core'])} core + {len(ev['diverse'])} diverse + "
-               f"{len(ev['boundary'])} boundary; {len(holdout)} held out; "
-               f"{len(ev['neighbour_codes'])} contrast clusters", level=2)
+    say(f"  · evidence: {len(ev['core'])} core + {len(ev['diverse'])} diverse + "
+        f"{len(ev['boundary'])} boundary; {len(holdout)} held out; "
+        f"{len(ev['neighbour_codes'])} contrast clusters")
 
     res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates),
                               "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
                                           "n_out": cfg.n_candidates})
     candidates = _candidates_of(res) or [{"label": cid, "description": "", "rationale": ""}]
-    ctx.report(f"  · [{cid}] proposed {len(candidates)} candidate(s): "
-               f"{', '.join(repr(c.get('label', '')) for c in candidates[:4])}", level=2)
+    say(f"  · proposed {len(candidates)} candidate(s): "
+        f"{', '.join(repr(c.get('label', '')) for c in candidates[:4])}")
 
     pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in holdout]
     neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng,
@@ -718,10 +762,10 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     for cand in candidates:
         best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids, rng)
         graded.append((best_cand, metrics))
-        ctx.report(f"  · [{cid}] graded {best_cand.get('label', '')!r}: "
-                   f"disc={_fmt_score(metrics.get('discrimination'))} "
-                   f"rec={_fmt_score(metrics.get('recall'))} "
-                   f"spec={_fmt_score(metrics.get('specificity'))}", level=2)
+        say(f"  · graded {best_cand.get('label', '')!r}: "
+            f"disc={_fmt_score(metrics.get('discrimination'))} "
+            f"rec={_fmt_score(metrics.get('recall'))} "
+            f"spec={_fmt_score(metrics.get('specificity'))}")
     graded.sort(key=lambda g: -_disc(g[1]))
     best_cand, best_metrics = graded[0]
     alternatives = [{"label": g[0]["label"], "description": g[0].get("description", ""),
@@ -730,8 +774,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     stability = _stability_score(ctx, code, train, best_cand["label"], rng)
     subthemes = _maybe_subthemes(ctx, idxs, ev["spread_ratio"], rng)
     if subthemes:
-        ctx.report(f"  · [{cid}] sub-themes detected: "
-                   f"{', '.join(repr(s['name']) for s in subthemes)}", level=2)
+        say(f"  · sub-themes detected: {', '.join(repr(s['name']) for s in subthemes)}")
 
     # When a cluster has no siblings (K == 1) there are no negatives, so precision
     # and specificity are unmeasured and discrimination is recall-only — flag it
@@ -739,9 +782,11 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     note = None if neg_texts else ("no sibling negatives: precision/specificity unmeasured, "
                                    "discrimination is recall-only")
 
-    return _finalize(ctx, cid, best_cand, n, metrics=best_metrics,
+    card = _finalize(ctx, cid, best_cand, n, metrics=best_metrics,
                      stability=stability, evidence=ev, alternatives=alternatives, subthemes=subthemes,
                      note=note, n_calls=ctx.client.calls_since_reset())
+    card["_log"] = log_lines
+    return card
 
 
 def _confidence_band(cfg: LabelConfig, metrics: dict, stability: Optional[float]) -> str:
@@ -926,7 +971,13 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
     nb_order = np.argsort(-sims, axis=1)
     idxs_by_code = [np.where(codes == c)[0] for c in range(K)]
 
-    bar = tqdm(total=K, desc="labeling", unit="cluster") if (progress and tqdm) else None
+    show_bars = bool(progress and tqdm)
+    # two stacked bars: clusters finished (determinate) + LLM calls made (count-up,
+    # since the total isn't known ahead of time — it depends on candidates, refine
+    # iterations, stability resamples, sub-themes and the coherence pass).
+    bar = tqdm(total=K, desc="labeling", unit="cluster", position=0, leave=True) if show_bars else None
+    call_bar = tqdm(total=None, desc="llm calls", unit="call", position=1, leave=True) if show_bars else None
+    client.call_bar = call_bar
     report = _Reporter(verbose, use_bar=bar is not None)
     ctx = _Ctx(emb_n=emb_n, cent=cent, nb_order=nb_order, text_arr=text_arr,
               idxs_by_code=idxs_by_code, cfg=cfg, client=client, K=K, report=report)
@@ -953,14 +1004,22 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
                 sc = _error_card(cid, size_of[cid], str(e))
             scorecards[cid] = sc
             done += 1
-            if bar:
+            if bar is not None:
                 bar.update(1)
-            report(_cluster_line(sc, done, K))
-    if bar:
+            # flush this cluster's whole block at once: header line (level 1)
+            # followed by its buffered stage detail (level 2), so concurrent
+            # workers never interleave their lines.
+            stage_lines = sc.pop("_log", [])
+            block = [_cluster_line(sc, done, K)]
+            block += [m for (lvl, m) in stage_lines if verbose >= lvl]
+            report("\n".join(block))
+    if bar is not None:
         bar.close()
 
     report("global coherence pass across all clusters …")
-    tally = _global_coherence_pass(scorecards, ctx, cid_of)
+    tally = _global_coherence_pass(scorecards, ctx, cid_of)  # may make more LLM calls
+    if call_bar is not None:
+        call_bar.close()
     report(_summary_lines(scorecards, tally, client, time.time() - t0))
     return {cid_of[c]: scorecards[cid_of[c]] for c in range(K)}
 
