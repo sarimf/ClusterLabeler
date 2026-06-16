@@ -179,6 +179,10 @@ cluster_labeler: done — 4 clusters in 18.3s, 612 LLM calls (3 empty)
 - `verbose=2` — also per-stage detail inside each cluster (evidence shape, candidates proposed,
   each candidate's grades, sub-themes).
 
+Even though clusters are labeled in parallel (`workers`), each cluster's lines are **buffered and
+flushed as one block** when it finishes, so the output stays grouped and readable instead of
+interleaving across workers.
+
 Every message is also sent to the `cluster_labeler` logger, so apps that configure logging can
 capture or route it; set `verbose=0` and use logging if you prefer.
 

@@ -675,21 +675,30 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     n = len(idxs)
     rng = np.random.default_rng([cfg.seed, code])
     ctx.client.reset_call_counter()
-    ctx.report(f"  · [{cid}] start (size {n})", level=2)
+    # Buffer this worker's stage messages and attach them to the returned card.
+    # With concurrent workers, printing live interleaves clusters; the caller
+    # flushes each cluster's lines as one atomic block when it finishes.
+    log_lines: List[Tuple[int, str]] = []
+    def say(msg: str, level: int = 2) -> None:
+        log_lines.append((level, msg))
+
+    say(f"  · start (size {n})")
 
     if n < cfg.min_cluster_size:
         ev = _build_evidence(code, idxs, ctx, rng)
         target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
         neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
-        ctx.report(f"  · [{cid}] small cluster — labeling from all {n} members, no held-out check", level=2)
+        say(f"  · small cluster — labeling from all {n} members, no held-out check")
         res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, 1),
                                   "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
         cands = _candidates_of(res)
         cand = cands[0] if cands else {"label": cid, "description": "", "rationale": ""}
-        return _finalize(ctx, cid, cand, n, metrics=dict(_NO_METRICS),
+        card = _finalize(ctx, cid, cand, n, metrics=dict(_NO_METRICS),
                          stability=None, evidence=ev, alternatives=[], subthemes=None,
                          note="cluster too small for held-out verification",
                          n_calls=ctx.client.calls_since_reset())
+        card["_log"] = log_lines
+        return card
 
     # held-out split: never shown to evidence/proposal/refine
     perm = rng.permutation(idxs)
@@ -699,16 +708,16 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     ev = _build_evidence(code, train, ctx, rng)
     target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
     neighbour_texts, shown_neighbour_ids = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
-    ctx.report(f"  · [{cid}] evidence: {len(ev['core'])} core + {len(ev['diverse'])} diverse + "
-               f"{len(ev['boundary'])} boundary; {len(holdout)} held out; "
-               f"{len(ev['neighbour_codes'])} contrast clusters", level=2)
+    say(f"  · evidence: {len(ev['core'])} core + {len(ev['diverse'])} diverse + "
+        f"{len(ev['boundary'])} boundary; {len(holdout)} held out; "
+        f"{len(ev['neighbour_codes'])} contrast clusters")
 
     res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates),
                               "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
                                           "n_out": cfg.n_candidates})
     candidates = _candidates_of(res) or [{"label": cid, "description": "", "rationale": ""}]
-    ctx.report(f"  · [{cid}] proposed {len(candidates)} candidate(s): "
-               f"{', '.join(repr(c.get('label', '')) for c in candidates[:4])}", level=2)
+    say(f"  · proposed {len(candidates)} candidate(s): "
+        f"{', '.join(repr(c.get('label', '')) for c in candidates[:4])}")
 
     pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in holdout]
     neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng,
@@ -718,10 +727,10 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     for cand in candidates:
         best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids, rng)
         graded.append((best_cand, metrics))
-        ctx.report(f"  · [{cid}] graded {best_cand.get('label', '')!r}: "
-                   f"disc={_fmt_score(metrics.get('discrimination'))} "
-                   f"rec={_fmt_score(metrics.get('recall'))} "
-                   f"spec={_fmt_score(metrics.get('specificity'))}", level=2)
+        say(f"  · graded {best_cand.get('label', '')!r}: "
+            f"disc={_fmt_score(metrics.get('discrimination'))} "
+            f"rec={_fmt_score(metrics.get('recall'))} "
+            f"spec={_fmt_score(metrics.get('specificity'))}")
     graded.sort(key=lambda g: -_disc(g[1]))
     best_cand, best_metrics = graded[0]
     alternatives = [{"label": g[0]["label"], "description": g[0].get("description", ""),
@@ -730,8 +739,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     stability = _stability_score(ctx, code, train, best_cand["label"], rng)
     subthemes = _maybe_subthemes(ctx, idxs, ev["spread_ratio"], rng)
     if subthemes:
-        ctx.report(f"  · [{cid}] sub-themes detected: "
-                   f"{', '.join(repr(s['name']) for s in subthemes)}", level=2)
+        say(f"  · sub-themes detected: {', '.join(repr(s['name']) for s in subthemes)}")
 
     # When a cluster has no siblings (K == 1) there are no negatives, so precision
     # and specificity are unmeasured and discrimination is recall-only — flag it
@@ -739,9 +747,11 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     note = None if neg_texts else ("no sibling negatives: precision/specificity unmeasured, "
                                    "discrimination is recall-only")
 
-    return _finalize(ctx, cid, best_cand, n, metrics=best_metrics,
+    card = _finalize(ctx, cid, best_cand, n, metrics=best_metrics,
                      stability=stability, evidence=ev, alternatives=alternatives, subthemes=subthemes,
                      note=note, n_calls=ctx.client.calls_since_reset())
+    card["_log"] = log_lines
+    return card
 
 
 def _confidence_band(cfg: LabelConfig, metrics: dict, stability: Optional[float]) -> str:
@@ -955,7 +965,13 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
             done += 1
             if bar:
                 bar.update(1)
-            report(_cluster_line(sc, done, K))
+            # flush this cluster's whole block at once: header line (level 1)
+            # followed by its buffered stage detail (level 2), so concurrent
+            # workers never interleave their lines.
+            stage_lines = sc.pop("_log", [])
+            block = [_cluster_line(sc, done, K)]
+            block += [m for (lvl, m) in stage_lines if verbose >= lvl]
+            report("\n".join(block))
     if bar:
         bar.close()
 

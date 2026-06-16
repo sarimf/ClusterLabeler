@@ -166,6 +166,28 @@ def test_failed_cluster_is_isolated():
     assert "failed" in cards["login"]["note"]
 
 
+def test_report_blocks_are_grouped_under_concurrency():
+    # With multiple workers, each cluster's buffered stage lines must flush as one
+    # contiguous block right after its header — never interleaved with other clusters.
+    import io, re, contextlib
+    df, emb, themes = _toy_dataset()
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True, workers=4),
+                       progress=False, verbose=2)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    header = re.compile(r"^\S+ \[\d+/\d+\] \[")            # "<glyph> [i/N] [cid] ..."
+    header_idx = [i for i, ln in enumerate(lines) if header.match(ln)]
+    assert len(header_idx) == len(themes)                  # one header per cluster
+    # the first detail line of every cluster ("· start") must immediately follow its header,
+    # which only holds if the block was emitted atomically (no interleaving)
+    for i in header_idx:
+        assert lines[i + 1].lstrip().startswith("· start"), lines[i + 1]
+    # and the returned cards must not carry the internal buffer
+    assert "_log" not in label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True),
+                                        progress=False, verbose=0)["billing"]
+
+
 if __name__ == "__main__":
     test_end_to_end_mock()
     test_fits_coercion()
@@ -176,4 +198,5 @@ if __name__ == "__main__":
     test_requires_gateway_unless_allow_mock()
     test_input_validation()
     test_failed_cluster_is_isolated()
+    test_report_blocks_are_grouped_under_concurrency()
     print("all tests passed")
