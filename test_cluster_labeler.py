@@ -188,6 +188,32 @@ def test_report_blocks_are_grouped_under_concurrency():
                                         progress=False, verbose=0)["billing"]
 
 
+def test_call_bar_counts_llm_calls():
+    # the "llm calls" tqdm bar must tick exactly once per LLM call
+    if cl.tqdm is None:
+        return  # tqdm not installed -> bars disabled, nothing to check
+    import io, contextlib
+    df, emb, _ = _toy_dataset()
+    captured = {}
+    orig = cl._LLMClient
+
+    class Probe(cl._LLMClient):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            captured["client"] = self
+
+    cl._LLMClient = Probe
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):  # swallow the bar rendering
+            cl.label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True, workers=4),
+                              progress=True, verbose=0)
+    finally:
+        cl._LLMClient = orig
+    c = captured["client"]
+    assert c.call_bar is not None
+    assert c.call_bar.n == c.n_calls > 0
+
+
 def test_hanging_gateway_times_out_not_deadlocks():
     # A stalled gateway call must NOT hang the whole batch: request_timeout bounds
     # each call so label_clusters still returns (with fallback labels).
@@ -231,6 +257,7 @@ if __name__ == "__main__":
     test_input_validation()
     test_failed_cluster_is_isolated()
     test_report_blocks_are_grouped_under_concurrency()
+    test_call_bar_counts_llm_calls()
     test_hanging_gateway_times_out_not_deadlocks()
     test_timeout_disabled_passes_through()
     print("all tests passed")

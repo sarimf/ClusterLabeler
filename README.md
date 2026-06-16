@@ -188,6 +188,23 @@ Even though clusters are labeled in parallel (`workers`), each cluster's lines a
 flushed as one block** when it finishes, so the output stays grouped and readable instead of
 interleaving across workers.
 
+### Progress bars
+
+With `tqdm` installed and `progress=True` (default), two live bars are shown:
+
+```text
+labeling:  75%|███████▌  | 3/4 [00:12<00:04, cluster/s]
+llm calls: 612call [00:12, 49.7call/s]
+```
+
+- **labeling** — clusters finished out of the total (determinate).
+- **llm calls** — a running count of LLM calls made, with a calls/sec rate. It's a count-up bar
+  (no fixed total) because the number of calls isn't known ahead of time — it depends on how many
+  candidates are proposed, how often refinement runs, stability resamples, sub-themes, and the
+  coherence pass. Handy for spotting a stalled gateway (the rate drops to zero).
+
+Bars are independent of `verbose`; set `progress=False` to disable them.
+
 Every message is also sent to the `cluster_labeler` logger, so apps that configure logging can
 capture or route it; set `verbose=0` and use logging if you prefer.
 
