@@ -38,7 +38,8 @@ def _toy_dataset():
 
 def test_end_to_end_mock():
     df, emb, themes = _toy_dataset()
-    cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(workers=4, allow_mock=True), progress=False)
+    cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(workers=4, allow_mock=True),
+                           progress=False, verbose=0)
     assert set(cards) == set(themes)
     for cid, sc in cards.items():
         assert sc["label"]
@@ -76,7 +77,7 @@ def test_single_cluster_flags_recall_only():
     rng = np.random.default_rng(1)
     df = pd.DataFrame({"text": ["alpha beta gamma"] * 12, "cluster_id": ["only"] * 12})
     emb = rng.normal(size=(12, 8)).astype(np.float32)
-    cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True), progress=False)
+    cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True), progress=False, verbose=0)
     sc = cards["only"]
     assert sc["scores"]["specificity"] is None
     assert sc["note"] and "recall-only" in sc["note"]
@@ -155,7 +156,8 @@ def test_failed_cluster_is_isolated():
     cl._label_one_cluster = boom
     logging.getLogger("cluster_labeler").setLevel(logging.CRITICAL)  # silence expected error
     try:
-        cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(workers=4, allow_mock=True), progress=False)
+        cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(workers=4, allow_mock=True),
+                               progress=False, verbose=0)
     finally:
         cl._label_one_cluster = orig
         logging.getLogger("cluster_labeler").setLevel(logging.WARNING)

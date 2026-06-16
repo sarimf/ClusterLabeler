@@ -38,6 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -56,6 +57,34 @@ log = logging.getLogger("cluster_labeler")
 
 __all__ = ["LabelConfig", "use_llm", "use_genai", "label_clusters", "labels_to_dataframe",
            "render_label_report"]
+
+
+class _Reporter:
+    """Thread-safe progress emitter. Prints to stderr (or via tqdm so a live
+    bar is not corrupted) regardless of the host's logging configuration, which
+    is why the old log.info() calls were invisible by default. Also mirrors
+    every message to the 'cluster_labeler' logger for apps that capture logs.
+
+    verbose levels:
+      0  silent
+      1  banner, one line per finished cluster, coherence flags, final summary
+      2  also per-stage detail within each cluster (propose / verify / refine / …)
+    """
+
+    def __init__(self, verbose: int, use_bar: bool):
+        self.verbose = int(verbose)
+        self.use_bar = use_bar and tqdm is not None
+        self._lock = threading.Lock()
+
+    def __call__(self, msg: str, level: int = 1) -> None:
+        log.info(msg)
+        if self.verbose < level:
+            return
+        with self._lock:
+            if self.use_bar:
+                tqdm.write(msg)
+            else:
+                print(msg, file=sys.stderr, flush=True)
 
 
 # ===========================================================================
@@ -349,6 +378,7 @@ class _Ctx:
     cfg: LabelConfig
     client: _LLMClient
     K: int
+    report: _Reporter
 
 
 def _micro_mode_medoids(emb_n: np.ndarray, idxs: np.ndarray, k: int, seed: int) -> Tuple[List[int], float]:
@@ -507,6 +537,10 @@ def _disc(metrics: dict) -> float:
     return metrics.get("discrimination") or 0.0
 
 
+def _fmt_score(v: Any) -> str:
+    return f"{v:.2f}" if isinstance(v, (int, float)) else "n/a"
+
+
 def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str], neg_texts: List[str],
                      rng: np.random.Generator) -> Tuple[dict, List[bool]]:
     """Grade a candidate as a classifier over held-out positives + sibling negatives.
@@ -641,11 +675,13 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     n = len(idxs)
     rng = np.random.default_rng([cfg.seed, code])
     ctx.client.reset_call_counter()
+    ctx.report(f"  · [{cid}] start (size {n})", level=2)
 
     if n < cfg.min_cluster_size:
         ev = _build_evidence(code, idxs, ctx, rng)
         target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
         neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
+        ctx.report(f"  · [{cid}] small cluster — labeling from all {n} members, no held-out check", level=2)
         res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, 1),
                                   "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
         cands = _candidates_of(res)
@@ -663,11 +699,16 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     ev = _build_evidence(code, train, ctx, rng)
     target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
     neighbour_texts, shown_neighbour_ids = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
+    ctx.report(f"  · [{cid}] evidence: {len(ev['core'])} core + {len(ev['diverse'])} diverse + "
+               f"{len(ev['boundary'])} boundary; {len(holdout)} held out; "
+               f"{len(ev['neighbour_codes'])} contrast clusters", level=2)
 
     res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates),
                               "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
                                           "n_out": cfg.n_candidates})
     candidates = _candidates_of(res) or [{"label": cid, "description": "", "rationale": ""}]
+    ctx.report(f"  · [{cid}] proposed {len(candidates)} candidate(s): "
+               f"{', '.join(repr(c.get('label', '')) for c in candidates[:4])}", level=2)
 
     pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in holdout]
     neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng,
@@ -677,6 +718,10 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     for cand in candidates:
         best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids, rng)
         graded.append((best_cand, metrics))
+        ctx.report(f"  · [{cid}] graded {best_cand.get('label', '')!r}: "
+                   f"disc={_fmt_score(metrics.get('discrimination'))} "
+                   f"rec={_fmt_score(metrics.get('recall'))} "
+                   f"spec={_fmt_score(metrics.get('specificity'))}", level=2)
     graded.sort(key=lambda g: -_disc(g[1]))
     best_cand, best_metrics = graded[0]
     alternatives = [{"label": g[0]["label"], "description": g[0].get("description", ""),
@@ -684,6 +729,9 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
 
     stability = _stability_score(ctx, code, train, best_cand["label"], rng)
     subthemes = _maybe_subthemes(ctx, idxs, ev["spread_ratio"], rng)
+    if subthemes:
+        ctx.report(f"  · [{cid}] sub-themes detected: "
+                   f"{', '.join(repr(s['name']) for s in subthemes)}", level=2)
 
     # When a cluster has no siblings (K == 1) there are no negatives, so precision
     # and specificity are unmeasured and discrimination is recall-only — flag it
@@ -763,12 +811,13 @@ def _error_card(cid: str, size: int, err: str) -> dict:
 # ===========================================================================
 # stage 6: global coherence pass
 # ===========================================================================
-def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[int, str]) -> None:
+def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[int, str]) -> Dict[str, int]:
     cfg = ctx.cfg
     cids = list(cid_of.values())
     code_of = {c: i for i, c in cid_of.items()}
     sims = ctx.cent @ ctx.cent.T
     n = len(cids)
+    tally = {"redifferentiated": 0, "confusable_pairs": 0}
     for i in range(n):
         for j in range(i + 1, n):  # each unordered pair is visited exactly once
             a_cid, b_cid = cids[i], cids[j]
@@ -780,6 +829,7 @@ def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[
                 b_idxs = ctx.idxs_by_code[code_of[b_cid]]
                 a_items = [_clip(ctx.text_arr[k], cfg.item_chars) for k in a_idxs[: cfg.n_core]]
                 b_items = [_clip(ctx.text_arr[k], cfg.item_chars) for k in b_idxs[: cfg.n_core]]
+                old_a, old_b = a["label"], b["label"]
                 res = ctx.client.complete(
                     _redifferentiate_prompt(cfg, a["label"], a["description"], a_items,
                                             b["label"], b["description"], b_items),
@@ -791,11 +841,18 @@ def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[
                     a["label"], a["description"] = res["a"]["label"], res["a"].get("description", a["description"])
                 if res.get("b", {}).get("label"):
                     b["label"], b["description"] = res["b"]["label"], res["b"].get("description", b["description"])
+                tally["redifferentiated"] += 1
+                ctx.report(f"  ↺ re-differentiated near-identical labels: [{a_cid}] {old_a!r}/[{b_cid}] {old_b!r} "
+                           f"→ {a['label']!r} / {b['label']!r}")
             elif cent_sim >= cfg.dedup_cent_sim and label_sim < cfg.dedup_label_jaccard:
                 a.setdefault("confusable_with", []).append({"cluster_id": b_cid, "label": b["label"],
                                                             "cent_similarity": round(cent_sim, 3)})
                 b.setdefault("confusable_with", []).append({"cluster_id": a_cid, "label": a["label"],
                                                             "cent_similarity": round(cent_sim, 3)})
+                tally["confusable_pairs"] += 1
+                ctx.report(f"  ⚠ confusable content: [{a_cid}] {a['label']!r} ~ [{b_cid}] {b['label']!r} "
+                           f"(centroid sim {cent_sim:.2f})")
+    return tally
 
 
 # ===========================================================================
@@ -804,7 +861,8 @@ def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[
 def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
                    text_col: str = "text", cluster_col: str = "cluster_id",
                    embedding_col: Optional[str] = None, cfg: Optional[LabelConfig] = None,
-                   llm_fn: Optional[Callable] = None, progress: bool = True) -> Dict[str, dict]:
+                   llm_fn: Optional[Callable] = None, progress: bool = True,
+                   verbose: int = 1) -> Dict[str, dict]:
     """Generate contrastive, held-out-verified labels for each cluster in `df`.
 
     Args:
@@ -812,6 +870,11 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
       embeddings: (n_rows, d) array aligned to df, OR pass `embedding_col` instead.
       llm_fn: (messages, json_mode=True) -> str. If omitted, uses use_llm()'s registered
               gateway, or falls back to an offline mock (for testing/demos only).
+      progress: show a tqdm progress bar (if tqdm is installed).
+      verbose: how much to print to stderr while running, independent of logging config:
+               0 = silent, 1 = banner + one line per finished cluster + final summary,
+               2 = also per-stage detail (evidence / propose / grade / sub-themes).
+               All messages are also emitted to the 'cluster_labeler' logger.
     Returns: {cluster_id: scorecard} (see module docstring for the fields).
     """
     cfg = cfg or LabelConfig()
@@ -863,31 +926,79 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
     nb_order = np.argsort(-sims, axis=1)
     idxs_by_code = [np.where(codes == c)[0] for c in range(K)]
 
-    ctx = _Ctx(emb_n=emb_n, cent=cent, nb_order=nb_order, text_arr=text_arr,
-              idxs_by_code=idxs_by_code, cfg=cfg, client=client, K=K)
-
-    log.info("labeling %d clusters (model=%s, workers=%d) …", K, cfg.model, cfg.workers)
-    size_of = {cid_of[c]: int(len(idxs_by_code[c])) for c in range(K)}
-    scorecards: Dict[str, dict] = {}
     bar = tqdm(total=K, desc="labeling", unit="cluster") if (progress and tqdm) else None
+    report = _Reporter(verbose, use_bar=bar is not None)
+    ctx = _Ctx(emb_n=emb_n, cent=cent, nb_order=nb_order, text_arr=text_arr,
+              idxs_by_code=idxs_by_code, cfg=cfg, client=client, K=K, report=report)
+
+    mode = "MOCK (offline)" if client.mock else f"model={cfg.model}"
+    sizes = [int(len(idxs_by_code[c])) for c in range(K)]
+    report(f"cluster_labeler: labeling {K} clusters over {len(df):,} items "
+           f"({mode}, workers={cfg.workers})")
+    report(f"  cluster sizes: min {min(sizes)}, median {int(np.median(sizes))}, max {max(sizes)}; "
+           f"acceptance bars: disc≥{cfg.accept_discrimination} rec≥{cfg.accept_recall} "
+           f"spec≥{cfg.accept_precision}")
+    size_of = {cid_of[c]: sizes[c] for c in range(K)}
+    scorecards: Dict[str, dict] = {}
+    t0 = time.time()
+    done = 0
     with ThreadPoolExecutor(max_workers=max(1, min(cfg.workers, K))) as ex:
         futs = {ex.submit(_label_one_cluster, c, cid_of[c], ctx): cid_of[c] for c in range(K)}
         for fut in as_completed(futs):
             cid = futs[fut]
             try:
-                scorecards[cid] = fut.result()
+                sc = fut.result()
             except Exception as e:  # one bad cluster must not abort the batch
                 log.exception("labeling cluster %s failed", cid)
-                scorecards[cid] = _error_card(cid, size_of[cid], str(e))
+                sc = _error_card(cid, size_of[cid], str(e))
+            scorecards[cid] = sc
+            done += 1
             if bar:
                 bar.update(1)
+            report(_cluster_line(sc, done, K))
     if bar:
         bar.close()
 
-    log.info("global coherence pass …")
-    _global_coherence_pass(scorecards, ctx, cid_of)
-    log.info("done: %d clusters, %d LLM calls (%d empty)", K, client.n_calls, client.n_empty)
+    report("global coherence pass across all clusters …")
+    tally = _global_coherence_pass(scorecards, ctx, cid_of)
+    report(_summary_lines(scorecards, tally, client, time.time() - t0))
     return {cid_of[c]: scorecards[cid_of[c]] for c in range(K)}
+
+
+def _cluster_line(sc: dict, done: int, total: int) -> str:
+    """One-line live summary of a finished cluster."""
+    s = sc["scores"]
+    conf = s["confidence"]
+    mark = {"high": "✓", "medium": "•", "low": "·", "unverified": "?", "error": "✗"}.get(conf, "·")
+    head = f"{mark} [{done}/{total}] [{sc['cluster_id']}] {sc['label']!r}  size={sc['size']:,}  {conf.upper()}"
+    if conf == "error":
+        return f"{head}  ({sc['note']})"
+    tail = (f"  disc={_fmt_score(s['discrimination'])} rec={_fmt_score(s['recall'])} "
+            f"prec={_fmt_score(s.get('precision'))} spec={_fmt_score(s.get('specificity'))} "
+            f"stab={_fmt_score(s['stability'])}  calls={sc['n_llm_calls']}")
+    extra = ""
+    if sc.get("subthemes"):
+        extra += f"  [{len(sc['subthemes'])} sub-themes]"
+    if sc.get("note"):
+        extra += f"  ({sc['note']})"
+    return head + tail + extra
+
+
+def _summary_lines(scorecards: Dict[str, dict], tally: Dict[str, int],
+                   client: _LLMClient, elapsed: float) -> str:
+    bands = ["high", "medium", "low", "unverified", "error"]
+    counts = {b: 0 for b in bands}
+    for sc in scorecards.values():
+        counts[sc["scores"]["confidence"]] = counts.get(sc["scores"]["confidence"], 0) + 1
+    n_sub = sum(1 for sc in scorecards.values() if sc.get("subthemes"))
+    lines = [
+        f"cluster_labeler: done — {len(scorecards)} clusters in {elapsed:.1f}s, "
+        f"{client.n_calls} LLM calls ({client.n_empty} empty)",
+        "  confidence: " + "  ".join(f"{b}={counts[b]}" for b in bands if counts[b]),
+        f"  flags: {n_sub} with sub-themes, {tally['confusable_pairs']} confusable pairs, "
+        f"{tally['redifferentiated']} re-differentiated",
+    ]
+    return "\n".join(lines)
 
 
 def labels_to_dataframe(scorecards: Dict[str, dict]) -> pd.DataFrame:

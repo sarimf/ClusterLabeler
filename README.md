@@ -156,6 +156,32 @@ scorecards = label_clusters(df, embeddings=embeddings, llm_fn=my_llm)
 
 ---
 
+## Watching it run (progress & logging)
+
+By default (`verbose=1`) the run is **not** a black box — it prints a banner, one line per
+finished cluster, any coherence flags, and a final summary to stderr (regardless of your logging
+setup):
+
+```text
+cluster_labeler: labeling 4 clusters over 109 items (model=gpt-4o, workers=8)
+  cluster sizes: min 4, median 32, max 40; acceptance bars: disc≥0.8 rec≥0.7 spec≥0.7
+✓ [1/4] [billing] 'Payment & refund disputes'  size=40  HIGH   disc=0.95 rec=0.97 prec=1.00 spec=0.92 stab=0.61  calls=7
+• [2/4] [login]   'Account access / password resets'  size=35  MEDIUM  disc=0.78 ...
+? [3/4] [tiny]    'Misc edge cases'  size=4  UNVERIFIED  ...  (cluster too small for held-out verification)
+  ⚠ confusable content: [shipping] 'Delivery delays' ~ [returns] 'Return delays' (centroid sim 0.61)
+cluster_labeler: done — 4 clusters in 18.3s, 612 LLM calls (3 empty)
+  confidence: high=1  medium=1  unverified=1  error=1
+  flags: 0 with sub-themes, 1 confusable pairs, 0 re-differentiated
+```
+
+- `verbose=0` — silent.
+- `verbose=1` — banner + per-cluster result + coherence flags + summary (default).
+- `verbose=2` — also per-stage detail inside each cluster (evidence shape, candidates proposed,
+  each candidate's grades, sub-themes).
+
+Every message is also sent to the `cluster_labeler` logger, so apps that configure logging can
+capture or route it; set `verbose=0` and use logging if you prefer.
+
 ## What you get back
 
 `label_clusters(...)` returns `{cluster_id: scorecard}`. Each **scorecard** is:
@@ -282,7 +308,8 @@ label_clusters(
     cluster_col="cluster_id",
     cfg=None,                    # LabelConfig (defaults if omitted)
     llm_fn=None,                 # per-call gateway (overrides use_llm)
-    progress=True,
+    progress=True,               # tqdm progress bar (if tqdm installed)
+    verbose=1,                   # 0 silent | 1 per-cluster + summary | 2 per-stage detail
 ) -> dict[str, scorecard]
 
 labels_to_dataframe(scorecards) -> pd.DataFrame    # one tidy row per cluster
