@@ -77,6 +77,11 @@ print(render_label_report(scorecards))
 
 > The gateway is called from multiple worker threads concurrently — make sure `my_llm` (and any
 > client it wraps) is thread-safe, or lower `workers` (see below).
+>
+> **If a run seems to hang:** it's almost always a stalled gateway call (rate-limit, dropped
+> connection, no server-side timeout). Each call is bounded by `request_timeout` (default 60s) so a
+> single hung request can't freeze the batch — lower it (e.g. `LabelConfig(request_timeout=20)`)
+> for snappier failure, and/or set a timeout inside `my_llm` itself.
 
 ### No model handy? Offline mock (testing/demos only)
 
@@ -290,6 +295,7 @@ stability, confidence, n_subthemes, n_confusable, note`.
 | `workers` | `16` | Thread-pool size. Your `llm_fn` must be thread-safe; lower this if not. |
 | `max_retries` | `3` | Retries per LLM call on error/unparseable output (exponential backoff). |
 | `backoff_base` | `0.5` | Initial backoff seconds between retries (doubles each retry). |
+| `request_timeout` | `60.0` | Seconds to wait for each gateway call before giving up (then retried). Bounds a stalled request so one hung call can't hang the whole batch. `0`/`None` disables. |
 | `allow_mock` | `False` | Must be `True` to run the offline mock when no gateway is registered. |
 
 > **Note:** `model` and `temperature` are stored on the config but not currently passed into the

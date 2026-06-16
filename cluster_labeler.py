@@ -139,6 +139,9 @@ class LabelConfig:
     workers: int = 16
     max_retries: int = 3
     backoff_base: float = 0.5
+    request_timeout: float = 60.0            # seconds per LLM call; 0/None disables.
+                                             # Bounds a stalled gateway so one hung
+                                             # network request can't hang the whole batch.
 
     # offline mock labeler is OPT-IN: label_clusters refuses to run without a
     # registered gateway / llm_fn unless this is explicitly set true. Prevents a
@@ -267,6 +270,32 @@ def _fits_of(res: Any, n: int) -> List[bool]:
     return _coerce_fits(raw, n)
 
 
+def _call_with_timeout(fn: Callable[[], Any], timeout: Optional[float]) -> Any:
+    """Run fn() but stop waiting after `timeout` seconds. A user gateway is an
+    arbitrary (usually blocking network) call; without a bound, one stalled
+    request hangs its worker forever and the whole batch never completes. The
+    call runs on a daemon thread, so on timeout we abandon it (it cannot block
+    interpreter exit) and raise TimeoutError, which the retry loop handles."""
+    if not timeout or timeout <= 0:
+        return fn()
+    box: Dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["v"] = fn()
+        except BaseException as e:  # propagate the gateway's own error to the caller
+            box["e"] = e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"LLM call exceeded {timeout:g}s")
+    if "e" in box:
+        raise box["e"]
+    return box.get("v")
+
+
 # ===========================================================================
 # LLM client (mock fallback = cheap extractive contrast, no network needed)
 # ===========================================================================
@@ -307,7 +336,9 @@ class _LLMClient:
         attempts = self.cfg.max_retries + 1
         for att in range(attempts):
             try:
-                v = _parse_json(self.fn(msgs, json_mode=True))
+                raw = _call_with_timeout(lambda: self.fn(msgs, json_mode=True),
+                                         self.cfg.request_timeout)
+                v = _parse_json(raw)
                 if v:
                     return v
                 # parse/empty failures used to be swallowed silently

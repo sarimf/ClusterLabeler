@@ -188,6 +188,38 @@ def test_report_blocks_are_grouped_under_concurrency():
                                         progress=False, verbose=0)["billing"]
 
 
+def test_hanging_gateway_times_out_not_deadlocks():
+    # A stalled gateway call must NOT hang the whole batch: request_timeout bounds
+    # each call so label_clusters still returns (with fallback labels).
+    import time
+    df = pd.DataFrame({"text": ["alpha beta gamma"] * 4 + ["delta epsilon zeta"] * 4,
+                       "cluster_id": ["alpha"] * 4 + ["beta"] * 4})
+    emb = np.random.default_rng(0).normal(size=(8, 8)).astype(np.float32)
+
+    def hanging_gateway(messages, json_mode=True):
+        time.sleep(30)            # simulate a network request that never returns in time
+        return "{}"
+
+    cfg = LabelConfig(request_timeout=0.2, max_retries=0, workers=4)
+    t0 = time.time()
+    cards = label_clusters(df, embeddings=emb, llm_fn=hanging_gateway, cfg=cfg,
+                           progress=False, verbose=0)
+    assert time.time() - t0 < 10, "batch hung instead of timing out the stalled gateway"
+    assert set(cards) == {"alpha", "beta"}      # both clusters still produced cards
+
+
+def test_timeout_disabled_passes_through():
+    from cluster_labeler import _call_with_timeout
+    assert _call_with_timeout(lambda: 42, None) == 42
+    assert _call_with_timeout(lambda: 42, 0) == 42
+    assert _call_with_timeout(lambda: 42, 5) == 42
+    try:
+        _call_with_timeout(lambda: (_ for _ in ()).throw(ValueError("boom")), 5)
+        raise AssertionError("expected the gateway error to propagate")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     test_end_to_end_mock()
     test_fits_coercion()
@@ -199,4 +231,6 @@ if __name__ == "__main__":
     test_input_validation()
     test_failed_cluster_is_isolated()
     test_report_blocks_are_grouped_under_concurrency()
+    test_hanging_gateway_times_out_not_deadlocks()
+    test_timeout_disabled_passes_through()
     print("all tests passed")
