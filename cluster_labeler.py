@@ -1,0 +1,745 @@
+"""cluster_labeler.py — contrastive, verified semantic labeling for text clusters.
+
+Standalone module: no dependency on cluster_judge.py. Takes a DataFrame (text +
+cluster id [+ optional embeddings]) and an LLM callable, returns a per-cluster
+scorecard: label, description, rationale, confidence scores, and evidence.
+
+Why this is not "summarize the centroid neighbours":
+  A label is a decision boundary, not a caption. It is generated and graded the
+  way a classifier would be:
+    1. EVIDENCE   - core (typical) + diverse (sub-modes) + boundary (where this
+                    cluster blurs into its nearest neighbour) + contrast samples
+                    from neighbouring clusters (what this is NOT).
+    2. PROPOSE    - several candidate cards, each required to be true of the
+                    target and false of the neighbours (contrastive, not just
+                    descriptive).
+    3. VERIFY     - score each candidate as a classifier on HELD-OUT items never
+                    shown during evidence/proposal: recall (held-out members
+                    accepted), precision (held-out sibling items rejected),
+                    discrimination (balanced accuracy of the two).
+    4. REFINE     - feed the best candidate's false negatives/positives back and
+                    ask for a revision; repeat until it clears a bar or the
+                    iteration budget runs out.
+    5. STABILITY  - resample the evidence and re-propose; a label that survives
+                    resampling is trustworthy, one that flips means the cluster
+                    itself is ill-defined.
+    6. SUB-THEMES + GLOBAL COHERENCE - flag clusters whose sub-modes look like
+                    two different things, and flag pairs of clusters whose
+                    labels collide despite distinct content (re-differentiated)
+                    or whose content overlaps despite distinct labels (flagged
+                    for merge review).
+
+Every claim a label makes should be backed by evidence a human can re-check;
+every score should come from held-out items the candidate never saw.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
+log = logging.getLogger("cluster_labeler")
+_log_lock = threading.Lock()
+
+__all__ = ["LabelConfig", "use_llm", "label_clusters", "labels_to_dataframe", "render_label_report"]
+
+
+# ===========================================================================
+# Config
+# ===========================================================================
+@dataclass
+class LabelConfig:
+    domain_hint: Optional[str] = None        # e.g. "customer support chat messages"
+    same_when: Optional[str] = None          # e.g. "they describe the same underlying issue"
+    item_chars: int = 400
+    desc_chars: int = 160
+
+    # evidence shape
+    n_core: int = 8                          # nearest-centroid exemplars (the "typical" member)
+    n_diverse: int = 6                       # micro-mode medoids (the spread / sub-themes)
+    n_boundary: int = 4                      # items closest to the nearest sibling centroid
+    micro_k: int = 6                         # micro-modes for the diverse sample
+    n_contrast_clusters: int = 3             # nearest sibling clusters shown as "what this is NOT"
+    n_contrast_items: int = 4                # exemplars per contrast cluster
+
+    # held-out verification (classifier-style grading, never seen by evidence/proposal)
+    holdout_frac: float = 0.3
+    min_holdout: int = 4
+    verify_negatives: int = 8                # held-out sibling items used as negatives
+
+    # candidate generation / refinement
+    n_candidates: int = 4
+    refine_max_iters: int = 2
+    accept_discrimination: float = 0.80
+    accept_recall: float = 0.70
+    accept_precision: float = 0.70
+
+    # stability (resample evidence, re-propose, compare)
+    stability_resamples: int = 2
+    stability_min_jaccard: float = 0.34
+
+    # sub-theme detection (informational; never overrides the main label)
+    subtheme_spread_ratio: float = 1.6       # inter/intra micro-mode spread trigger
+    subtheme_min_size: int = 16
+
+    # global coherence pass across all clusters' finished cards
+    dedup_label_jaccard: float = 0.6         # near-identical label text -> re-differentiate
+    dedup_cent_sim: float = 0.55             # near-identical content -> flag for merge review
+
+    # small clusters: skip holdout split, label from all members, mark low confidence
+    min_cluster_size: int = 6
+
+    # judge
+    model: str = "mock"
+    temperature: float = 0.2
+    seed: int = 7
+    workers: int = 16
+    max_retries: int = 3
+    backoff_base: float = 0.5
+
+
+_GATEWAY: List[Optional[Callable]] = [None]
+
+
+def use_llm(fn: Callable[[List[dict], bool], str]) -> None:
+    """Register the judge gateway once: fn(messages, json_mode=True) -> str (raw model text)."""
+    _GATEWAY[0] = fn
+
+
+# ===========================================================================
+# small helpers
+# ===========================================================================
+def _normalize(emb: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(emb, axis=1, keepdims=True)
+    n[n == 0] = 1.0
+    return (emb / n).astype(np.float32)
+
+
+def _clip(t: Any, n: int) -> str:
+    t = str(t).replace("\n", " ").strip()
+    return t if len(t) <= n else t[: n - 1] + "…"
+
+
+def _numbered(items: Sequence[str]) -> str:
+    return "\n".join(f"{i + 1}. {t}" for i, t in enumerate(items))
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+_STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "was",
+         "were", "be", "this", "that", "it", "with", "as", "at", "by", "from", "i", "you"}
+
+
+def _tokens(s: str) -> set:
+    return {w for w in _WORD_RE.findall(str(s).lower()) if w not in _STOP and len(w) > 2}
+
+
+def _jaccard(a: str, b: str) -> float:
+    ta, tb = _tokens(a), _tokens(b)
+    if not ta and not tb:
+        return 1.0
+    u = ta | tb
+    return len(ta & tb) / len(u) if u else 0.0
+
+
+_JSON_RE = re.compile(r"\{.*\}", re.S)
+
+
+def _parse_json(s: Any) -> Optional[dict]:
+    if isinstance(s, dict):
+        return s
+    if not isinstance(s, str):
+        return None
+    s = s.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s)
+    try:
+        return json.loads(s)
+    except Exception:
+        m = _JSON_RE.search(s)
+        if m:
+            try:
+                return json.loads(m.group(0))
+            except Exception:
+                return None
+    return None
+
+
+# ===========================================================================
+# LLM client (mock fallback = cheap extractive contrast, no network needed)
+# ===========================================================================
+class _LLMClient:
+    def __init__(self, cfg: LabelConfig, llm_fn: Optional[Callable]):
+        self.cfg = cfg
+        self.fn = llm_fn
+        self.mock = llm_fn is None
+        self.n_calls = 0
+        self.n_empty = 0
+        self._lock = threading.Lock()
+
+    def complete(self, prompt: str, mock_kind: str, mock_ctx: dict) -> dict:
+        with self._lock:
+            self.n_calls += 1
+        if self.mock:
+            return _mock_response(mock_kind, mock_ctx)
+        msgs = [{"role": "system", "content": "You are a careful analyst. Reply with STRICT JSON only."},
+                {"role": "user", "content": prompt}]
+        delay = self.cfg.backoff_base
+        for att in range(self.cfg.max_retries + 1):
+            try:
+                v = _parse_json(self.fn(msgs, json_mode=True))
+                if v:
+                    return v
+            except Exception as e:
+                if att == self.cfg.max_retries:
+                    log.warning("LLM call failed after retries (%s): %s", mock_kind, e)
+            time.sleep(delay)
+            delay *= 2
+        with self._lock:
+            self.n_empty += 1
+        return {}
+
+
+def _mock_response(kind: str, ctx: dict) -> dict:
+    """Offline fallback: simple word-contrast heuristic so the pipeline is testable
+    without a real model registered. Not meant to produce good labels."""
+    if kind == "propose":
+        target_words: Dict[str, int] = {}
+        for t in ctx["target_texts"]:
+            for w in _tokens(t):
+                target_words[w] = target_words.get(w, 0) + 1
+        neighbour_words = set()
+        for t in ctx["neighbour_texts"]:
+            neighbour_words |= _tokens(t)
+        distinctive = [w for w, _ in sorted(target_words.items(), key=lambda kv: -kv[1])
+                       if w not in neighbour_words]
+        if not distinctive:
+            distinctive = [w for w, _ in sorted(target_words.items(), key=lambda kv: -kv[1])]
+        cands = []
+        for i in range(ctx["n_out"]):
+            words = distinctive[i:i + 2] or distinctive[:2] or ["misc", "items"]
+            label = " ".join(w.capitalize() for w in words) or "Misc"
+            cands.append({"label": label, "description": f"Items mentioning {' / '.join(words)}.",
+                          "rationale": "mock: distinctive word overlap vs neighbours"})
+        return {"candidates": cands}
+    if kind == "verify":
+        label_words = _tokens(ctx["label"]) | _tokens(ctx["description"])
+        fits = []
+        for t in ctx["items"]:
+            ov = len(_tokens(t) & label_words)
+            fits.append(ov > 0)
+        return {"fits": fits}
+    if kind == "refine":
+        return {"label": ctx["label"], "description": ctx["description"],
+                "rationale": "mock: no-op refine"}
+    if kind == "stability":
+        return _mock_response("propose", {**ctx, "n_out": 1})["candidates"][0]
+    if kind == "subtheme":
+        return {"names": [f"sub-theme {i + 1}" for i in range(len(ctx["groups"]))]}
+    if kind == "redifferentiate":
+        return {"a": {"label": ctx["a_label"] + " (A)", "description": ctx["a_desc"]},
+                "b": {"label": ctx["b_label"] + " (B)", "description": ctx["b_desc"]}}
+    return {}
+
+
+# ===========================================================================
+# evidence construction
+# ===========================================================================
+@dataclass
+class _Ctx:
+    emb_n: np.ndarray
+    cent: np.ndarray
+    nb_order: np.ndarray
+    text_arr: np.ndarray
+    idxs_by_code: List[np.ndarray]
+    cfg: LabelConfig
+    client: _LLMClient
+    K: int
+
+
+def _micro_mode_medoids(emb_n: np.ndarray, idxs: np.ndarray, k: int, seed: int) -> Tuple[List[int], float]:
+    """k representative medoids spanning the item's sub-modes, plus a spread ratio
+    (mean inter-medoid distance / mean intra-mode distance) used for sub-theme detection."""
+    n = len(idxs)
+    k = max(1, min(k, n))
+    if n <= k or n < 4:
+        return list(map(int, idxs)), 1.0
+    from sklearn.cluster import MiniBatchKMeans
+    km = MiniBatchKMeans(n_clusters=k, random_state=seed, n_init=1).fit(emb_n[idxs])
+    medoids, intra = [], []
+    for m in range(k):
+        mem = idxs[km.labels_ == m]
+        if len(mem) == 0:
+            continue
+        c = km.cluster_centers_[m]
+        d = np.linalg.norm(emb_n[mem] - c, axis=1)
+        medoids.append(int(mem[int(np.argmin(d))]))
+        intra.append(float(d.mean()))
+    if len(medoids) < 2:
+        return medoids, 1.0
+    mc = _normalize(km.cluster_centers_[: len(medoids)])
+    inter = 1 - (mc @ mc.T)
+    iu = np.triu_indices(len(medoids), k=1)
+    inter_mean = float(inter[iu].mean()) if len(iu[0]) else 0.0
+    intra_mean = float(np.mean(intra)) or 1e-6
+    return medoids, inter_mean / intra_mean
+
+
+def _build_evidence(code: int, train_idxs: np.ndarray, ctx: _Ctx, rng: np.random.Generator) -> dict:
+    cfg = ctx.cfg
+    sims = ctx.emb_n[train_idxs] @ ctx.cent[code]
+    order = np.argsort(-sims)
+    core = [int(train_idxs[i]) for i in order[: min(cfg.n_core, len(train_idxs))]]
+
+    diverse_pool = np.setdiff1d(train_idxs, np.asarray(core))
+    diverse, spread_ratio = (_micro_mode_medoids(ctx.emb_n, diverse_pool, cfg.micro_k, cfg.seed)
+                              if len(diverse_pool) else ([], 1.0))
+    diverse = diverse[: cfg.n_diverse]
+
+    neighbour_codes = [int(x) for x in ctx.nb_order[code][: min(cfg.n_contrast_clusters, ctx.K - 1)]]
+    boundary: List[int] = []
+    if neighbour_codes:
+        nb_cent = _normalize(ctx.cent[neighbour_codes].mean(axis=0, keepdims=True))[0]
+        bsims = ctx.emb_n[train_idxs] @ nb_cent
+        bord = np.argsort(-bsims)[: cfg.n_boundary]
+        boundary = [int(train_idxs[i]) for i in bord]
+
+    return dict(core=core, diverse=diverse, boundary=boundary,
+                neighbour_codes=neighbour_codes, spread_ratio=spread_ratio)
+
+
+def _neighbour_exemplars(ctx: _Ctx, neighbour_codes: Sequence[int], n_each: int,
+                         rng: np.random.Generator) -> Tuple[List[str], List[int]]:
+    texts, ids = [], []
+    for nc in neighbour_codes:
+        nidxs = ctx.idxs_by_code[nc]
+        if len(nidxs) == 0:
+            continue
+        nsims = ctx.emb_n[nidxs] @ ctx.cent[nc]
+        top = nidxs[np.argsort(-nsims)[: n_each]]
+        for i in top:
+            texts.append(_clip(ctx.text_arr[i], ctx.cfg.item_chars))
+            ids.append(int(i))
+    return texts, ids
+
+
+def _sample_negatives(ctx: _Ctx, neighbour_codes: Sequence[int], n: int,
+                      rng: np.random.Generator) -> Tuple[List[int], List[str]]:
+    pool: List[int] = []
+    for nc in neighbour_codes:
+        pool.extend(int(i) for i in ctx.idxs_by_code[nc])
+    if not pool:
+        return [], []
+    take = min(n, len(pool))
+    chosen = list(rng.choice(np.asarray(pool), size=take, replace=False))
+    return chosen, [_clip(ctx.text_arr[i], ctx.cfg.item_chars) for i in chosen]
+
+
+# ===========================================================================
+# prompts
+# ===========================================================================
+def _head(cfg: LabelConfig) -> str:
+    h = ""
+    if cfg.domain_hint:
+        h += f"# domain: {cfg.domain_hint}\n"
+    if cfg.same_when:
+        h += f"# rule: two items are the same kind when {cfg.same_when}\n"
+    return h
+
+
+def _propose_prompt(cfg: LabelConfig, target_texts: List[str], neighbour_texts: List[str], n_out: int) -> str:
+    return (_head(cfg) +
+            f"TARGET ITEMS (core + sub-modes of one cluster):\n{_numbered(target_texts)}\n\n"
+            f"NEIGHBOUR ITEMS (sampled from the nearest OTHER clusters - what the target is NOT):\n"
+            f"{_numbered(neighbour_texts)}\n\n"
+            f"Propose {n_out} DISTINCT candidate cards for the TARGET cluster. Each card's label+"
+            "description must be TRUE of every target item and FALSE of the neighbour items - name "
+            "the attribute that separates them, not a topic word they share. Candidates must differ "
+            "from each other in wording or angle, not be paraphrases.\n"
+            'Return STRICT JSON: {"candidates":[{"label":"<=8 words","description":"<=25 words",'
+            '"rationale":"<=20 words, what separates target from neighbours"}]}')
+
+
+def _verify_prompt(cfg: LabelConfig, label: str, description: str, items: List[str]) -> str:
+    return (_head(cfg) +
+            f"CARD - LABEL: {label}\nDESCRIPTION: {description}\n\n"
+            f"For each numbered item below, does it FIT the card (true member)? Items are a mix; "
+            f"judge each independently and strictly - do not assume most will fit.\n"
+            f"ITEMS:\n{_numbered(items)}\n"
+            'Return STRICT JSON: {"fits":[true,false,...]} (one entry per item, in order)')
+
+
+def _refine_prompt(cfg: LabelConfig, label: str, description: str,
+                   false_negatives: List[str], false_positives: List[str]) -> str:
+    fn = _numbered(false_negatives) if false_negatives else "(none)"
+    fp = _numbered(false_positives) if false_positives else "(none)"
+    return (_head(cfg) +
+            f"CURRENT CARD - LABEL: {label}\nDESCRIPTION: {description}\n\n"
+            f"This card WRONGLY REJECTED these true members (should fit but didn't, broaden if needed):\n{fn}\n\n"
+            f"This card WRONGLY ACCEPTED these non-members (should NOT fit but did, narrow/sharpen if needed):\n{fp}\n\n"
+            "Revise the label and description to fix both kinds of error.\n"
+            'Return STRICT JSON: {"label":"<=8 words","description":"<=25 words","rationale":"<=20 words"}')
+
+
+def _subtheme_prompt(cfg: LabelConfig, groups: List[List[str]]) -> str:
+    body = "\n\n".join(f"GROUP {i + 1}:\n{_numbered(g)}" for i, g in enumerate(groups))
+    return (_head(cfg) +
+            f"These look like sub-themes within one cluster. Name each group specifically (<=6 words):\n{body}\n"
+            'Return STRICT JSON: {"names":["...", "..."]}')
+
+
+def _redifferentiate_prompt(cfg: LabelConfig, a_label, a_desc, a_items, b_label, b_desc, b_items) -> str:
+    return (_head(cfg) +
+            "Two clusters currently have near-identical labels but are different clusters. Revise BOTH "
+            "labels/descriptions so they are clearly distinct from each other, each still accurate to its items.\n"
+            f"CLUSTER A - LABEL: {a_label}\nDESCRIPTION: {a_desc}\nITEMS:\n{_numbered(a_items)}\n\n"
+            f"CLUSTER B - LABEL: {b_label}\nDESCRIPTION: {b_desc}\nITEMS:\n{_numbered(b_items)}\n"
+            'Return STRICT JSON: {"a":{"label":"...","description":"..."},'
+            '"b":{"label":"...","description":"..."}}')
+
+
+# ===========================================================================
+# stage 2/3: verification + refinement
+# ===========================================================================
+def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str], neg_texts: List[str]) -> Tuple[float, float, float]:
+    cfg = ctx.cfg
+    items = pos_texts + neg_texts
+    if not items:
+        return 0.0, 0.0, 0.0
+    res = ctx.client.complete(
+        _verify_prompt(cfg, cand["label"], cand.get("description", ""), items),
+        "verify", {"label": cand["label"], "description": cand.get("description", ""), "items": items})
+    fits = res.get("fits") or [False] * len(items)
+    fits = (fits + [False] * len(items))[: len(items)]
+    n_pos, n_neg = len(pos_texts), len(neg_texts)
+    recall = sum(1 for f in fits[:n_pos] if f) / n_pos if n_pos else None
+    precision_neg_reject = sum(1 for f in fits[n_pos:] if not f) / n_neg if n_neg else None
+    if recall is None:
+        discrimination = precision_neg_reject
+    elif precision_neg_reject is None:
+        discrimination = recall
+    else:
+        discrimination = (recall + precision_neg_reject) / 2
+    return recall, precision_neg_reject, discrimination
+
+
+def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int],
+                 neg_texts: List[str], neg_ids: List[int]) -> Tuple[dict, float, float, float]:
+    cfg = ctx.cfg
+    recall, precision, disc = _grade_candidate(ctx, cand, pos_texts, neg_texts)
+    best = (cand, recall or 0.0, precision or 0.0, disc or 0.0)
+    for _ in range(cfg.refine_max_iters):
+        if best[3] >= cfg.accept_discrimination:
+            break
+        items = pos_texts + neg_texts
+        res = ctx.client.complete(
+            _verify_prompt(cfg, best[0]["label"], best[0].get("description", ""), items),
+            "verify", {"label": best[0]["label"], "description": best[0].get("description", ""), "items": items})
+        fits = res.get("fits") or [False] * len(items)
+        fits = (fits + [False] * len(items))[: len(items)]
+        n_pos = len(pos_texts)
+        false_neg = [pos_texts[i] for i, f in enumerate(fits[:n_pos]) if not f]
+        false_pos = [neg_texts[i] for i, f in enumerate(fits[n_pos:]) if f]
+        if not false_neg and not false_pos:
+            break
+        rev = ctx.client.complete(
+            _refine_prompt(cfg, best[0]["label"], best[0].get("description", ""), false_neg, false_pos),
+            "refine", {"label": best[0]["label"], "description": best[0].get("description", "")})
+        if not rev.get("label"):
+            break
+        new_cand = {"label": rev["label"], "description": rev.get("description", ""),
+                    "rationale": rev.get("rationale", best[0].get("rationale", ""))}
+        r2, p2, d2 = _grade_candidate(ctx, new_cand, pos_texts, neg_texts)
+        if (d2 or 0.0) >= best[3]:
+            best = (new_cand, r2 or 0.0, p2 or 0.0, d2 or 0.0)
+        else:
+            break
+    return best
+
+
+# ===========================================================================
+# stage 4: stability
+# ===========================================================================
+def _stability_score(ctx: _Ctx, code: int, train_idxs: np.ndarray, base_label: str,
+                     rng: np.random.Generator) -> float:
+    cfg = ctx.cfg
+    if cfg.stability_resamples <= 0 or len(train_idxs) < cfg.n_core + 2:
+        return 1.0
+    sims_total = []
+    for _ in range(cfg.stability_resamples):
+        resample = rng.choice(train_idxs, size=min(len(train_idxs), max(cfg.n_core, len(train_idxs) // 2)),
+                              replace=False)
+        ev = _build_evidence(code, resample, ctx, rng)
+        target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"])]
+        neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
+        res = ctx.client.complete(
+            _propose_prompt(cfg, target_texts, neighbour_texts, 1),
+            "stability", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
+        cands = res.get("candidates") or ([res] if res.get("label") else [])
+        if cands:
+            sims_total.append(_jaccard(base_label, cands[0].get("label", "")))
+    return float(np.mean(sims_total)) if sims_total else 1.0
+
+
+# ===========================================================================
+# stage 5: sub-themes (informational)
+# ===========================================================================
+def _maybe_subthemes(ctx: _Ctx, idxs: np.ndarray, spread_ratio: float, rng: np.random.Generator) -> Optional[List[dict]]:
+    cfg = ctx.cfg
+    if spread_ratio < cfg.subtheme_spread_ratio or len(idxs) < cfg.subtheme_min_size:
+        return None
+    from sklearn.cluster import MiniBatchKMeans
+    km = MiniBatchKMeans(n_clusters=2, random_state=cfg.seed, n_init=1).fit(ctx.emb_n[idxs])
+    groups, group_ids = [], []
+    for m in range(2):
+        mem = idxs[km.labels_ == m]
+        if len(mem) == 0:
+            continue
+        c = km.cluster_centers_[m]
+        order = np.argsort(np.linalg.norm(ctx.emb_n[mem] - c, axis=1))[:6]
+        group_ids.append([int(x) for x in mem[order]])
+        groups.append([_clip(ctx.text_arr[i], cfg.item_chars) for i in mem[order]])
+    if len(groups) < 2:
+        return None
+    res = ctx.client.complete(_subtheme_prompt(cfg, groups), "subtheme", {"groups": groups})
+    names = res.get("names") or [f"sub-theme {i + 1}" for i in range(len(groups))]
+    return [{"name": names[i] if i < len(names) else f"sub-theme {i + 1}",
+             "size": int((km.labels_ == i).sum()), "exemplar_ids": group_ids[i]}
+            for i in range(len(groups))]
+
+
+# ===========================================================================
+# per-cluster pipeline
+# ===========================================================================
+def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
+    cfg = ctx.cfg
+    idxs = ctx.idxs_by_code[code]
+    n = len(idxs)
+    rng = np.random.default_rng([cfg.seed, code])
+    n_calls_before = ctx.client.n_calls
+
+    if n < cfg.min_cluster_size:
+        ev = _build_evidence(code, idxs, ctx, rng)
+        target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
+        neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
+        res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, 1),
+                                  "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
+        cands = res.get("candidates") or []
+        cand = cands[0] if cands else {"label": cid, "description": "", "rationale": ""}
+        return _finalize(cfg, cid, cand, n, recall=None, precision=None, discrimination=None,
+                         stability=None, evidence=ev, alternatives=[], subthemes=None,
+                         note="cluster too small for held-out verification",
+                         n_calls=ctx.client.n_calls - n_calls_before)
+
+    # held-out split: never shown to evidence/proposal/refine
+    perm = rng.permutation(idxs)
+    n_hold = min(max(cfg.min_holdout, int(round(n * cfg.holdout_frac))), n - 3)
+    holdout, train = perm[:n_hold], perm[n_hold:]
+
+    ev = _build_evidence(code, train, ctx, rng)
+    target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
+    neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
+
+    res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates),
+                              "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
+                                          "n_out": cfg.n_candidates})
+    candidates = res.get("candidates") or [{"label": cid, "description": "", "rationale": ""}]
+
+    pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in holdout]
+    neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng)
+
+    graded = []
+    for cand in candidates:
+        best_cand, recall, precision, disc = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids)
+        graded.append((best_cand, recall, precision, disc))
+    graded.sort(key=lambda g: -g[3])
+    best_cand, recall, precision, discrimination = graded[0]
+    alternatives = [{"label": g[0]["label"], "description": g[0].get("description", ""),
+                     "discrimination": g[3]} for g in graded[1:]]
+
+    stability = _stability_score(ctx, code, train, best_cand["label"], rng)
+    subthemes = _maybe_subthemes(ctx, idxs, ev["spread_ratio"], rng)
+
+    return _finalize(cfg, cid, best_cand, n, recall=recall, precision=precision, discrimination=discrimination,
+                     stability=stability, evidence=ev, alternatives=alternatives, subthemes=subthemes,
+                     note=None, n_calls=ctx.client.n_calls - n_calls_before)
+
+
+def _confidence_band(cfg: LabelConfig, discrimination: Optional[float], stability: Optional[float]) -> str:
+    if discrimination is None:
+        return "unverified"
+    if discrimination >= cfg.accept_discrimination and (stability is None or stability >= cfg.stability_min_jaccard):
+        return "high"
+    if discrimination >= 0.6:
+        return "medium"
+    return "low"
+
+
+def _finalize(cfg, cid, cand, size, *, recall, precision, discrimination, stability, evidence,
+             alternatives, subthemes, note, n_calls) -> dict:
+    return {
+        "cluster_id": cid,
+        "label": cand.get("label", cid),
+        "description": cand.get("description", ""),
+        "rationale": cand.get("rationale", ""),
+        "size": size,
+        "scores": {
+            "recall": recall, "precision": precision, "discrimination": discrimination,
+            "stability": stability, "confidence": _confidence_band(cfg, discrimination, stability),
+        },
+        "alternatives": alternatives,
+        "confusable_with": [],
+        "subthemes": subthemes,
+        "evidence": {"core": evidence.get("core", []), "diverse": evidence.get("diverse", []),
+                     "boundary": evidence.get("boundary", [])},
+        "n_llm_calls": n_calls,
+        "note": note,
+    }
+
+
+# ===========================================================================
+# stage 6: global coherence pass
+# ===========================================================================
+def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[int, str]) -> None:
+    cfg = ctx.cfg
+    cids = list(cid_of.values())
+    code_of = {c: i for i, c in cid_of.items()}
+    sims = ctx.cent @ ctx.cent.T
+    n = len(cids)
+    redone = set()
+    for i in range(n):
+        for j in range(i + 1, n):
+            a_cid, b_cid = cids[i], cids[j]
+            a, b = scorecards[a_cid], scorecards[b_cid]
+            cent_sim = float(sims[i, j])
+            label_sim = _jaccard(a["label"], b["label"])
+            if label_sim >= cfg.dedup_label_jaccard and cent_sim < cfg.dedup_cent_sim and \
+               (a_cid, b_cid) not in redone:
+                a_idxs = ctx.idxs_by_code[code_of[a_cid]]
+                b_idxs = ctx.idxs_by_code[code_of[b_cid]]
+                a_items = [_clip(ctx.text_arr[k], cfg.item_chars) for k in a_idxs[: cfg.n_core]]
+                b_items = [_clip(ctx.text_arr[k], cfg.item_chars) for k in b_idxs[: cfg.n_core]]
+                res = ctx.client.complete(
+                    _redifferentiate_prompt(cfg, a["label"], a["description"], a_items,
+                                            b["label"], b["description"], b_items),
+                    "redifferentiate", {"a_label": a["label"], "a_desc": a["description"],
+                                        "b_label": b["label"], "b_desc": b["description"]})
+                if res.get("a", {}).get("label"):
+                    a["label"], a["description"] = res["a"]["label"], res["a"].get("description", a["description"])
+                if res.get("b", {}).get("label"):
+                    b["label"], b["description"] = res["b"]["label"], res["b"].get("description", b["description"])
+                redone.add((a_cid, b_cid))
+            elif cent_sim >= cfg.dedup_cent_sim and label_sim < cfg.dedup_label_jaccard:
+                a.setdefault("confusable_with", []).append({"cluster_id": b_cid, "label": b["label"],
+                                                            "cent_similarity": round(cent_sim, 3)})
+                b.setdefault("confusable_with", []).append({"cluster_id": a_cid, "label": a["label"],
+                                                            "cent_similarity": round(cent_sim, 3)})
+
+
+# ===========================================================================
+# public entry point
+# ===========================================================================
+def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
+                   text_col: str = "text", cluster_col: str = "cluster_id",
+                   embedding_col: Optional[str] = None, cfg: Optional[LabelConfig] = None,
+                   llm_fn: Optional[Callable] = None, progress: bool = True) -> Dict[str, dict]:
+    """Generate contrastive, held-out-verified labels for each cluster in `df`.
+
+    Args:
+      df: rows with at least `text_col` and `cluster_col`.
+      embeddings: (n_rows, d) array aligned to df, OR pass `embedding_col` instead.
+      llm_fn: (messages, json_mode=True) -> str. If omitted, uses use_llm()'s registered
+              gateway, or falls back to an offline mock (for testing/demos only).
+    Returns: {cluster_id: scorecard} (see module docstring for the fields).
+    """
+    cfg = cfg or LabelConfig()
+    client = _LLMClient(cfg, llm_fn or _GATEWAY[0])
+    df = df.reset_index(drop=True)
+    text_arr = df[text_col].astype(str).to_numpy()
+    if embeddings is None:
+        if not embedding_col:
+            raise ValueError("pass `embeddings` or `embedding_col`")
+        embeddings = np.stack(df[embedding_col].to_numpy())
+    emb_n = _normalize(np.asarray(embeddings, dtype=np.float32))
+
+    cats = pd.Categorical(df[cluster_col].astype(str))
+    codes = cats.codes
+    cid_of = {i: str(c) for i, c in enumerate(cats.categories)}
+    K = len(cats.categories)
+
+    cent = np.zeros((K, emb_n.shape[1]), dtype=np.float32)
+    for c in range(K):
+        cent[c] = emb_n[codes == c].mean(axis=0)
+    cent = _normalize(cent)
+    sims = cent @ cent.T
+    np.fill_diagonal(sims, -2)
+    nb_order = np.argsort(-sims, axis=1)
+    idxs_by_code = [np.where(codes == c)[0] for c in range(K)]
+
+    ctx = _Ctx(emb_n=emb_n, cent=cent, nb_order=nb_order, text_arr=text_arr,
+              idxs_by_code=idxs_by_code, cfg=cfg, client=client, K=K)
+
+    log.info("labeling %d clusters (model=%s, workers=%d) …", K, cfg.model, cfg.workers)
+    scorecards: Dict[str, dict] = {}
+    bar = tqdm(total=K, desc="labeling", unit="cluster") if (progress and tqdm) else None
+    with ThreadPoolExecutor(max_workers=max(1, min(cfg.workers, K))) as ex:
+        futs = {ex.submit(_label_one_cluster, c, cid_of[c], ctx): cid_of[c] for c in range(K)}
+        for fut in futs:
+            cid = futs[fut]
+            scorecards[cid] = fut.result()
+            if bar:
+                bar.update(1)
+    if bar:
+        bar.close()
+
+    log.info("global coherence pass …")
+    _global_coherence_pass(scorecards, ctx, cid_of)
+    log.info("done: %d clusters, %d LLM calls (%d empty)", K, client.n_calls, client.n_empty)
+    return {cid_of[c]: scorecards[cid_of[c]] for c in range(K)}
+
+
+def labels_to_dataframe(scorecards: Dict[str, dict]) -> pd.DataFrame:
+    rows = []
+    for cid, sc in scorecards.items():
+        sco = sc["scores"]
+        rows.append({"cluster_id": cid, "label": sc["label"], "description": sc["description"],
+                     "size": sc["size"], "recall": sco["recall"], "precision": sco["precision"],
+                     "discrimination": sco["discrimination"], "stability": sco["stability"],
+                     "confidence": sco["confidence"], "n_subthemes": len(sc["subthemes"] or []),
+                     "n_confusable": len(sc["confusable_with"]), "note": sc["note"]})
+    return pd.DataFrame(rows)
+
+
+def render_label_report(scorecards: Dict[str, dict]) -> str:
+    lines = ["=" * 70, f"CLUSTER LABELS  ({len(scorecards)} clusters)", "=" * 70]
+    for cid, sc in scorecards.items():
+        sco = sc["scores"]
+        conf = sco["confidence"].upper()
+        disc = f"{sco['discrimination']:.2f}" if sco["discrimination"] is not None else "n/a"
+        stab = f"{sco['stability']:.2f}" if sco["stability"] is not None else "n/a"
+        lines.append(f"\n[{cid}] {sc['label']}  (size {sc['size']:,}, confidence {conf}, "
+                     f"discrimination {disc}, stability {stab})")
+        if sc["description"]:
+            lines.append(f"   {sc['description']}")
+        if sc["note"]:
+            lines.append(f"   note: {sc['note']}")
+        if sc["subthemes"]:
+            for st in sc["subthemes"]:
+                lines.append(f"   sub-theme: {st['name']} (size {st['size']})")
+        if sc["confusable_with"]:
+            for cw in sc["confusable_with"]:
+                lines.append(f"   confusable with [{cw['cluster_id']}] {cw['label']} "
+                             f"(centroid sim {cw['cent_similarity']})")
+    return "\n".join(lines)
