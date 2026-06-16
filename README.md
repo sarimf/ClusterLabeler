@@ -188,22 +188,19 @@ Even though clusters are labeled in parallel (`workers`), each cluster's lines a
 flushed as one block** when it finishes, so the output stays grouped and readable instead of
 interleaving across workers.
 
-### Progress bars
+### Progress bar
 
-With `tqdm` installed and `progress=True` (default), two live bars are shown:
+With `tqdm` installed and `progress=True` (default), a single live bar tracks clusters finished,
+with the running **LLM-call count and rate in its postfix**:
 
 ```text
-labeling:  75%|███████▌  | 3/4 [00:12<00:04, cluster/s]
-llm calls: 612call [00:12, 49.7call/s]
+labeling:  75%|███████▌  | 3/4 [00:12<00:04, cluster/s, 612 llm calls · 49.7/s]
 ```
 
-- **labeling** — clusters finished out of the total (determinate).
-- **llm calls** — a running count of LLM calls made, with a calls/sec rate. It's a count-up bar
-  (no fixed total) because the number of calls isn't known ahead of time — it depends on how many
-  candidates are proposed, how often refinement runs, stability resamples, sub-themes, and the
-  coherence pass. Handy for spotting a stalled gateway (the rate drops to zero).
-
-Bars are independent of `verbose`; set `progress=False` to disable them.
+The call count rides in the postfix (rather than a second bar — a second stacked bar spams a new
+line per update inside Jupyter) and is handy for spotting a stalled gateway: the calls/sec drops to
+zero. `tqdm.auto` is used, so you get the native widget bar in notebooks and the console bar
+elsewhere. The bar is independent of `verbose`; set `progress=False` to disable it.
 
 Every message is also sent to the `cluster_labeler` logger, so apps that configure logging can
 capture or route it; set `verbose=0` and use logging if you prefer.

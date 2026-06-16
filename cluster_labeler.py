@@ -49,7 +49,10 @@ import numpy as np
 import pandas as pd
 
 try:
-    from tqdm import tqdm
+    # tqdm.auto picks the notebook-native widget bar inside Jupyter and the
+    # console bar elsewhere — avoids the multi-line spam plain tqdm produces in
+    # notebooks (which don't support the ANSI cursor moves stacked bars need).
+    from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
     tqdm = None
 
@@ -313,12 +316,37 @@ class _LLMClient:
         self.n_calls = 0
         self.n_empty = 0
         self._lock = threading.Lock()
-        # optional tqdm bar that ticks once per LLM call (set by label_clusters).
-        self.call_bar = None
+        # live LLM-call count shown in the (single) progress bar's postfix.
+        # A second stacked bar spams new lines in notebooks, so we keep one bar
+        # and update its suffix instead. Set by label_clusters.
+        self.progress_bar = None
+        self.progress_lock: Optional[threading.Lock] = None
+        self._t0 = time.time()
+        self._last_post = 0.0
         # per-thread call counter: each cluster is labeled start-to-finish on a
         # single worker thread, so a thread-local count is the only correct way
         # to attribute LLM calls to a cluster when workers run concurrently.
         self._local = threading.local()
+
+    def _tick_bar(self, force: bool = False) -> None:
+        """Refresh the progress bar's postfix with the running LLM-call count and
+        rate. Throttled, and serialized with the main thread's bar.update() via a
+        shared lock so concurrent worker updates don't corrupt the bar."""
+        bar = self.progress_bar
+        if bar is None:
+            return
+        now = time.time()
+        if not force and now - self._last_post < 0.2:
+            return
+        self._last_post = now
+        rate = self.n_calls / max(now - self._t0, 1e-9)
+        text = f"{self.n_calls} llm calls · {rate:.1f}/s"
+        lock = self.progress_lock
+        if lock is not None:
+            with lock:
+                bar.set_postfix_str(text, refresh=True)
+        else:
+            bar.set_postfix_str(text, refresh=True)
 
     def reset_call_counter(self) -> None:
         self._local.count = 0
@@ -329,8 +357,7 @@ class _LLMClient:
     def complete(self, prompt: str, mock_kind: str, mock_ctx: dict) -> dict:
         with self._lock:
             self.n_calls += 1
-            if self.call_bar is not None:    # live count of LLM calls (thread-safe under the lock)
-                self.call_bar.update(1)
+        self._tick_bar()                     # live count of LLM calls in the bar postfix
         self._local.count = getattr(self._local, "count", 0) + 1
         if self.mock:
             return _mock_response(mock_kind, mock_ctx)
@@ -972,12 +999,14 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
     idxs_by_code = [np.where(codes == c)[0] for c in range(K)]
 
     show_bars = bool(progress and tqdm)
-    # two stacked bars: clusters finished (determinate) + LLM calls made (count-up,
-    # since the total isn't known ahead of time — it depends on candidates, refine
-    # iterations, stability resamples, sub-themes and the coherence pass).
-    bar = tqdm(total=K, desc="labeling", unit="cluster", position=0, leave=True) if show_bars else None
-    call_bar = tqdm(total=None, desc="llm calls", unit="call", position=1, leave=True) if show_bars else None
-    client.call_bar = call_bar
+    # ONE bar: clusters finished (determinate), with the running LLM-call count
+    # and rate in its postfix. A second stacked bar spams a new line per update
+    # in notebooks, so the call count rides along in this bar's suffix instead.
+    bar = tqdm(total=K, desc="labeling", unit="cluster") if show_bars else None
+    bar_lock = threading.Lock()
+    client.progress_bar = bar
+    client.progress_lock = bar_lock
+    client._t0 = time.time()
     report = _Reporter(verbose, use_bar=bar is not None)
     ctx = _Ctx(emb_n=emb_n, cent=cent, nb_order=nb_order, text_arr=text_arr,
               idxs_by_code=idxs_by_code, cfg=cfg, client=client, K=K, report=report)
@@ -1005,7 +1034,9 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
             scorecards[cid] = sc
             done += 1
             if bar is not None:
-                bar.update(1)
+                with bar_lock:
+                    bar.update(1)
+                client._tick_bar(force=True)   # refresh call count on every completion
             # flush this cluster's whole block at once: header line (level 1)
             # followed by its buffered stage detail (level 2), so concurrent
             # workers never interleave their lines.
@@ -1013,13 +1044,11 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
             block = [_cluster_line(sc, done, K)]
             block += [m for (lvl, m) in stage_lines if verbose >= lvl]
             report("\n".join(block))
-    if bar is not None:
-        bar.close()
-
     report("global coherence pass across all clusters …")
     tally = _global_coherence_pass(scorecards, ctx, cid_of)  # may make more LLM calls
-    if call_bar is not None:
-        call_bar.close()
+    if bar is not None:
+        client._tick_bar(force=True)           # final call count (incl. coherence pass)
+        bar.close()
     report(_summary_lines(scorecards, tally, client, time.time() - t0))
     return {cid_of[c]: scorecards[cid_of[c]] for c in range(K)}
 
