@@ -80,6 +80,29 @@ def test_single_cluster_flags_recall_only():
     sc = cards["only"]
     assert sc["scores"]["specificity"] is None
     assert sc["note"] and "recall-only" in sc["note"]
+    # with no siblings to reject, a label cannot earn "high" confidence
+    assert sc["scores"]["confidence"] != "high"
+
+
+def test_parse_json_robustness():
+    from cluster_labeler import _parse_json, _candidates_of, _fits_of
+    # trailing prose around an object
+    assert _parse_json('Sure!\n{"label": "X"}\nHope that helps') == {"label": "X"}
+    # code fence
+    assert _parse_json('```json\n{"a": 1}\n```') == {"a": 1}
+    # bare top-level array, recovered for both candidates and fits
+    assert _candidates_of(_parse_json('[{"label":"A"},{"label":"B"}]')) == [{"label": "A"}, {"label": "B"}]
+    assert _fits_of(_parse_json("[true, false, true]"), 3) == [True, False, True]
+    # single bare card object
+    assert _candidates_of({"label": "Solo"}) == [{"label": "Solo"}]
+    assert _parse_json("not json at all") is None
+
+
+def test_confidence_caps_without_specificity():
+    cfg = LabelConfig()
+    # strong recall + discrimination but specificity never measured -> not "high"
+    m = {"recall": 0.95, "precision": None, "specificity": None, "discrimination": 0.95}
+    assert _confidence_band(cfg, m, None) == "medium"
 
 
 def test_fits_coercion():
@@ -145,7 +168,9 @@ if __name__ == "__main__":
     test_end_to_end_mock()
     test_fits_coercion()
     test_confidence_gating_enforces_recall_and_specificity()
+    test_confidence_caps_without_specificity()
     test_single_cluster_flags_recall_only()
+    test_parse_json_robustness()
     test_requires_gateway_unless_allow_mock()
     test_input_validation()
     test_failed_cluster_is_isolated()

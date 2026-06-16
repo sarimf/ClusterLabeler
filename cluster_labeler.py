@@ -189,27 +189,53 @@ def _jaccard(a: str, b: str) -> float:
     return len(ta & tb) / len(u) if u else 0.0
 
 
-_JSON_RE = re.compile(r"\{.*\}", re.S)
+_OBJ_RE = re.compile(r"\{.*\}", re.S)
+_ARR_RE = re.compile(r"\[.*\]", re.S)
 
 
-def _parse_json(s: Any) -> Optional[dict]:
-    if isinstance(s, dict):
+def _parse_json(s: Any) -> Optional[Any]:
+    """Parse a model reply into a dict or list. Tolerates code fences, leading/
+    trailing prose, and a bare top-level array (some models drop the wrapper)."""
+    if isinstance(s, (dict, list)):
         return s
     if not isinstance(s, str):
         return None
     s = s.strip()
     if s.startswith("```"):
-        s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s)
+        s = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", s).strip()
     try:
         return json.loads(s)
     except Exception:
-        m = _JSON_RE.search(s)
+        pass
+    # fall back to extracting the outermost object, then the outermost array
+    for rx in (_OBJ_RE, _ARR_RE):
+        m = rx.search(s)
         if m:
             try:
                 return json.loads(m.group(0))
             except Exception:
-                return None
+                continue
     return None
+
+
+def _candidates_of(res: Any) -> List[dict]:
+    """Extract candidate cards whether the model wrapped them ({"candidates":[...]}),
+    returned a bare list, or returned a single card object."""
+    if isinstance(res, list):
+        return [c for c in res if isinstance(c, dict)]
+    if isinstance(res, dict):
+        cands = res.get("candidates")
+        if isinstance(cands, list):
+            return [c for c in cands if isinstance(c, dict)]
+        if res.get("label"):
+            return [res]
+    return []
+
+
+def _fits_of(res: Any, n: int) -> List[bool]:
+    """Extract per-item verdicts whether wrapped ({"fits":[...]}) or a bare list."""
+    raw = res if isinstance(res, list) else (res.get("fits") if isinstance(res, dict) else None)
+    return _coerce_fits(raw, n)
 
 
 # ===========================================================================
@@ -481,12 +507,12 @@ def _disc(metrics: dict) -> float:
     return metrics.get("discrimination") or 0.0
 
 
-def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str],
-                     neg_texts: List[str]) -> Tuple[dict, List[bool]]:
+def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str], neg_texts: List[str],
+                     rng: np.random.Generator) -> Tuple[dict, List[bool]]:
     """Grade a candidate as a classifier over held-out positives + sibling negatives.
 
-    Returns a metrics dict and the per-item verdicts. The metrics are reported
-    under their correct statistical names:
+    Returns a metrics dict and the per-item verdicts (in original pos-then-neg
+    order). The metrics are reported under their correct statistical names:
       recall        = held-out members accepted          TP / (TP+FN)
       precision     = of items it accepts, share correct TP / (TP+FP)
       specificity   = sibling items correctly rejected   TN / (TN+FP)
@@ -497,10 +523,18 @@ def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str],
     items = pos_texts + neg_texts
     if not items:
         return none_metrics, []
+    # Shuffle members and siblings together before grading: presenting all
+    # positives first then all negatives is a positional tell that lets the
+    # judge infer the boundary instead of judging each item on its merits.
+    perm = rng.permutation(len(items))
+    shuffled = [items[i] for i in perm]
     res = ctx.client.complete(
-        _verify_prompt(cfg, cand["label"], cand.get("description", ""), items),
-        "verify", {"label": cand["label"], "description": cand.get("description", ""), "items": items})
-    fits = _coerce_fits(res.get("fits"), len(items))
+        _verify_prompt(cfg, cand["label"], cand.get("description", ""), shuffled),
+        "verify", {"label": cand["label"], "description": cand.get("description", ""), "items": shuffled})
+    shuffled_fits = _fits_of(res, len(items))
+    fits = [False] * len(items)                       # un-shuffle back to pos-then-neg order
+    for shuf_pos, orig_idx in enumerate(perm):
+        fits[orig_idx] = shuffled_fits[shuf_pos]
     n_pos, n_neg = len(pos_texts), len(neg_texts)
     tp = sum(1 for f in fits[:n_pos] if f)
     fp = sum(1 for f in fits[n_pos:] if f)
@@ -514,9 +548,9 @@ def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str],
 
 
 def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int],
-                 neg_texts: List[str], neg_ids: List[int]) -> Tuple[dict, dict]:
+                 neg_texts: List[str], neg_ids: List[int], rng: np.random.Generator) -> Tuple[dict, dict]:
     cfg = ctx.cfg
-    best_cand, best_metrics, best_fits = cand, *_grade_candidate(ctx, cand, pos_texts, neg_texts)
+    best_cand, best_metrics, best_fits = cand, *_grade_candidate(ctx, cand, pos_texts, neg_texts, rng)
     n_pos = len(pos_texts)
     for _ in range(cfg.refine_max_iters):
         if _disc(best_metrics) >= cfg.accept_discrimination:
@@ -531,11 +565,11 @@ def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int]
         rev = ctx.client.complete(
             _refine_prompt(cfg, best_cand["label"], best_cand.get("description", ""), false_neg, false_pos),
             "refine", {"label": best_cand["label"], "description": best_cand.get("description", "")})
-        if not rev.get("label"):
+        if not isinstance(rev, dict) or not rev.get("label"):
             break
         new_cand = {"label": rev["label"], "description": rev.get("description", ""),
                     "rationale": rev.get("rationale", best_cand.get("rationale", ""))}
-        m2, f2 = _grade_candidate(ctx, new_cand, pos_texts, neg_texts)
+        m2, f2 = _grade_candidate(ctx, new_cand, pos_texts, neg_texts, rng)
         if _disc(m2) >= _disc(best_metrics):
             best_cand, best_metrics, best_fits = new_cand, m2, f2
         else:
@@ -547,10 +581,13 @@ def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int]
 # stage 4: stability
 # ===========================================================================
 def _stability_score(ctx: _Ctx, code: int, train_idxs: np.ndarray, base_label: str,
-                     rng: np.random.Generator) -> float:
+                     rng: np.random.Generator) -> Optional[float]:
+    # None means "not assessed" (resampling disabled or too few items) — distinct
+    # from a measured 1.0. Reported as n/a and treated as neutral by the confidence
+    # band, so a small cluster isn't silently credited with perfect stability.
     cfg = ctx.cfg
     if cfg.stability_resamples <= 0 or len(train_idxs) < cfg.n_core + 2:
-        return 1.0
+        return None
     sims_total = []
     for _ in range(cfg.stability_resamples):
         resample = rng.choice(train_idxs, size=min(len(train_idxs), max(cfg.n_core, len(train_idxs) // 2)),
@@ -561,10 +598,10 @@ def _stability_score(ctx: _Ctx, code: int, train_idxs: np.ndarray, base_label: s
         res = ctx.client.complete(
             _propose_prompt(cfg, target_texts, neighbour_texts, 1),
             "stability", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
-        cands = res.get("candidates") or ([res] if res.get("label") else [])
+        cands = _candidates_of(res)
         if cands:
             sims_total.append(_jaccard(base_label, cands[0].get("label", "")))
-    return float(np.mean(sims_total)) if sims_total else 1.0
+    return float(np.mean(sims_total)) if sims_total else None
 
 
 # ===========================================================================
@@ -588,7 +625,8 @@ def _maybe_subthemes(ctx: _Ctx, idxs: np.ndarray, spread_ratio: float, rng: np.r
     if len(groups) < 2:
         return None
     res = ctx.client.complete(_subtheme_prompt(cfg, groups), "subtheme", {"groups": groups})
-    names = res.get("names") or [f"sub-theme {i + 1}" for i in range(len(groups))]
+    names = (res.get("names") if isinstance(res, dict) else None) or \
+            [f"sub-theme {i + 1}" for i in range(len(groups))]
     return [{"name": names[i] if i < len(names) else f"sub-theme {i + 1}",
              "size": int((km.labels_ == i).sum()), "exemplar_ids": group_ids[i]}
             for i in range(len(groups))]
@@ -610,7 +648,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
         neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
         res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, 1),
                                   "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
-        cands = res.get("candidates") or []
+        cands = _candidates_of(res)
         cand = cands[0] if cands else {"label": cid, "description": "", "rationale": ""}
         return _finalize(ctx, cid, cand, n, metrics=dict(_NO_METRICS),
                          stability=None, evidence=ev, alternatives=[], subthemes=None,
@@ -629,7 +667,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates),
                               "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
                                           "n_out": cfg.n_candidates})
-    candidates = res.get("candidates") or [{"label": cid, "description": "", "rationale": ""}]
+    candidates = _candidates_of(res) or [{"label": cid, "description": "", "rationale": ""}]
 
     pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in holdout]
     neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng,
@@ -637,7 +675,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
 
     graded = []
     for cand in candidates:
-        best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids)
+        best_cand, metrics = _refine_loop(ctx, cand, pos_texts, list(holdout), neg_texts, neg_ids, rng)
         graded.append((best_cand, metrics))
     graded.sort(key=lambda g: -_disc(g[1]))
     best_cand, best_metrics = graded[0]
@@ -668,7 +706,9 @@ def _confidence_band(cfg: LabelConfig, metrics: dict, stability: Optional[float]
     # a recall-0.45 / specificity-0.95 label scores discrimination 0.70 but misses
     # half its members, so accept_recall/accept_precision are enforced here too.
     recall_ok = recall is None or recall >= cfg.accept_recall
-    spec_ok = spec is None or spec >= cfg.accept_precision
+    # specificity must be MEASURED and pass: a label that never had a sibling to
+    # reject (no negatives, e.g. K==1) has not earned "high", only recall-only.
+    spec_ok = spec is not None and spec >= cfg.accept_precision
     if disc >= cfg.accept_discrimination and recall_ok and spec_ok and stable:
         return "high"
     if disc >= 0.6:
@@ -745,6 +785,8 @@ def _global_coherence_pass(scorecards: Dict[str, dict], ctx: _Ctx, cid_of: Dict[
                                             b["label"], b["description"], b_items),
                     "redifferentiate", {"a_label": a["label"], "a_desc": a["description"],
                                         "b_label": b["label"], "b_desc": b["description"]})
+                if not isinstance(res, dict):
+                    res = {}
                 if res.get("a", {}).get("label"):
                     a["label"], a["description"] = res["a"]["label"], res["a"].get("description", a["description"])
                 if res.get("b", {}).get("label"):
@@ -863,13 +905,16 @@ def labels_to_dataframe(scorecards: Dict[str, dict]) -> pd.DataFrame:
 
 def render_label_report(scorecards: Dict[str, dict]) -> str:
     lines = ["=" * 70, f"CLUSTER LABELS  ({len(scorecards)} clusters)", "=" * 70]
+    def _fmt(v):
+        return f"{v:.2f}" if isinstance(v, (int, float)) else "n/a"
+
     for cid, sc in scorecards.items():
         sco = sc["scores"]
         conf = sco["confidence"].upper()
-        disc = f"{sco['discrimination']:.2f}" if sco["discrimination"] is not None else "n/a"
-        stab = f"{sco['stability']:.2f}" if sco["stability"] is not None else "n/a"
         lines.append(f"\n[{cid}] {sc['label']}  (size {sc['size']:,}, confidence {conf}, "
-                     f"discrimination {disc}, stability {stab})")
+                     f"discrimination {_fmt(sco['discrimination'])}, stability {_fmt(sco['stability'])})")
+        lines.append(f"   recall {_fmt(sco['recall'])}  precision {_fmt(sco.get('precision'))}  "
+                     f"specificity {_fmt(sco.get('specificity'))}")
         if sc["description"]:
             lines.append(f"   {sc['description']}")
         if sc["note"]:
