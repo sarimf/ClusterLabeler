@@ -39,8 +39,8 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -52,7 +52,6 @@ except Exception:  # pragma: no cover
     tqdm = None
 
 log = logging.getLogger("cluster_labeler")
-_log_lock = threading.Lock()
 
 __all__ = ["LabelConfig", "use_llm", "label_clusters", "labels_to_dataframe", "render_label_report"]
 
@@ -137,6 +136,31 @@ def _numbered(items: Sequence[str]) -> str:
     return "\n".join(f"{i + 1}. {t}" for i, t in enumerate(items))
 
 
+_TRUE_STRS = {"true", "yes", "y", "t", "1", "fit", "fits", "member"}
+
+
+def _as_bool(x: Any) -> bool:
+    """Coerce a model-supplied verdict to bool. Models often return strings
+    ("true"/"false") or 0/1 instead of JSON booleans; a naive ``if x`` would
+    treat the string "false" as truthy and silently corrupt every score."""
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, (int, float)):
+        return x != 0
+    if isinstance(x, str):
+        return x.strip().lower() in _TRUE_STRS
+    return bool(x)
+
+
+def _coerce_fits(raw: Any, n: int) -> List[bool]:
+    """Normalise a model 'fits' array to exactly n booleans (pad with False)."""
+    seq = raw if isinstance(raw, list) else []
+    fits = [_as_bool(v) for v in seq]
+    if len(fits) < n:
+        fits = fits + [False] * (n - len(fits))
+    return fits[:n]
+
+
 _WORD_RE = re.compile(r"[a-z0-9]+")
 _STOP = {"the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "is", "are", "was",
          "were", "be", "this", "that", "it", "with", "as", "at", "by", "from", "i", "you"}
@@ -188,10 +212,21 @@ class _LLMClient:
         self.n_calls = 0
         self.n_empty = 0
         self._lock = threading.Lock()
+        # per-thread call counter: each cluster is labeled start-to-finish on a
+        # single worker thread, so a thread-local count is the only correct way
+        # to attribute LLM calls to a cluster when workers run concurrently.
+        self._local = threading.local()
+
+    def reset_call_counter(self) -> None:
+        self._local.count = 0
+
+    def calls_since_reset(self) -> int:
+        return getattr(self._local, "count", 0)
 
     def complete(self, prompt: str, mock_kind: str, mock_ctx: dict) -> dict:
         with self._lock:
             self.n_calls += 1
+        self._local.count = getattr(self._local, "count", 0) + 1
         if self.mock:
             return _mock_response(mock_kind, mock_ctx)
         msgs = [{"role": "system", "content": "You are a careful analyst. Reply with STRICT JSON only."},
@@ -336,10 +371,15 @@ def _neighbour_exemplars(ctx: _Ctx, neighbour_codes: Sequence[int], n_each: int,
 
 
 def _sample_negatives(ctx: _Ctx, neighbour_codes: Sequence[int], n: int,
-                      rng: np.random.Generator) -> Tuple[List[int], List[str]]:
+                      rng: np.random.Generator,
+                      exclude: Optional[set] = None) -> Tuple[List[int], List[str]]:
+    # negatives must be HELD OUT: drop any sibling items already shown to the
+    # model as contrast exemplars during proposal, otherwise the precision
+    # (sibling-rejection) score is measured on items the candidate already saw.
+    exclude = exclude or set()
     pool: List[int] = []
     for nc in neighbour_codes:
-        pool.extend(int(i) for i in ctx.idxs_by_code[nc])
+        pool.extend(int(i) for i in ctx.idxs_by_code[nc] if int(i) not in exclude)
     if not pool:
         return [], []
     take = min(n, len(pool))
@@ -413,16 +453,19 @@ def _redifferentiate_prompt(cfg: LabelConfig, a_label, a_desc, a_items, b_label,
 # ===========================================================================
 # stage 2/3: verification + refinement
 # ===========================================================================
-def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str], neg_texts: List[str]) -> Tuple[float, float, float]:
+# NOTE on the "precision" score: it is the sibling-REJECTION rate
+# (true negatives / negatives), i.e. specificity, not text-book precision
+# TP/(TP+FP). "discrimination" is the balanced accuracy of recall+specificity.
+def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str],
+                     neg_texts: List[str]) -> Tuple[Optional[float], Optional[float], Optional[float], List[bool]]:
     cfg = ctx.cfg
     items = pos_texts + neg_texts
     if not items:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, []
     res = ctx.client.complete(
         _verify_prompt(cfg, cand["label"], cand.get("description", ""), items),
         "verify", {"label": cand["label"], "description": cand.get("description", ""), "items": items})
-    fits = res.get("fits") or [False] * len(items)
-    fits = (fits + [False] * len(items))[: len(items)]
+    fits = _coerce_fits(res.get("fits"), len(items))
     n_pos, n_neg = len(pos_texts), len(neg_texts)
     recall = sum(1 for f in fits[:n_pos] if f) / n_pos if n_pos else None
     precision_neg_reject = sum(1 for f in fits[n_pos:] if not f) / n_neg if n_neg else None
@@ -432,26 +475,24 @@ def _grade_candidate(ctx: _Ctx, cand: dict, pos_texts: List[str], neg_texts: Lis
         discrimination = recall
     else:
         discrimination = (recall + precision_neg_reject) / 2
-    return recall, precision_neg_reject, discrimination
+    return recall, precision_neg_reject, discrimination, fits
 
 
 def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int],
                  neg_texts: List[str], neg_ids: List[int]) -> Tuple[dict, float, float, float]:
     cfg = ctx.cfg
-    recall, precision, disc = _grade_candidate(ctx, cand, pos_texts, neg_texts)
+    recall, precision, disc, fits = _grade_candidate(ctx, cand, pos_texts, neg_texts)
     best = (cand, recall or 0.0, precision or 0.0, disc or 0.0)
+    best_fits = fits
+    n_pos = len(pos_texts)
     for _ in range(cfg.refine_max_iters):
         if best[3] >= cfg.accept_discrimination:
             break
-        items = pos_texts + neg_texts
-        res = ctx.client.complete(
-            _verify_prompt(cfg, best[0]["label"], best[0].get("description", ""), items),
-            "verify", {"label": best[0]["label"], "description": best[0].get("description", ""), "items": items})
-        fits = res.get("fits") or [False] * len(items)
-        fits = (fits + [False] * len(items))[: len(items)]
-        n_pos = len(pos_texts)
-        false_neg = [pos_texts[i] for i, f in enumerate(fits[:n_pos]) if not f]
-        false_pos = [neg_texts[i] for i, f in enumerate(fits[n_pos:]) if f]
+        # reuse the verdicts from the grading we already paid for instead of
+        # re-running verify on the same items (halves the calls per iteration
+        # and keeps false-pos/neg consistent with the score that drove us here).
+        false_neg = [pos_texts[i] for i, f in enumerate(best_fits[:n_pos]) if not f]
+        false_pos = [neg_texts[i] for i, f in enumerate(best_fits[n_pos:]) if f]
         if not false_neg and not false_pos:
             break
         rev = ctx.client.complete(
@@ -461,9 +502,10 @@ def _refine_loop(ctx: _Ctx, cand: dict, pos_texts: List[str], pos_ids: List[int]
             break
         new_cand = {"label": rev["label"], "description": rev.get("description", ""),
                     "rationale": rev.get("rationale", best[0].get("rationale", ""))}
-        r2, p2, d2 = _grade_candidate(ctx, new_cand, pos_texts, neg_texts)
+        r2, p2, d2, f2 = _grade_candidate(ctx, new_cand, pos_texts, neg_texts)
         if (d2 or 0.0) >= best[3]:
             best = (new_cand, r2 or 0.0, p2 or 0.0, d2 or 0.0)
+            best_fits = f2
         else:
             break
     return best
@@ -528,7 +570,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     idxs = ctx.idxs_by_code[code]
     n = len(idxs)
     rng = np.random.default_rng([cfg.seed, code])
-    n_calls_before = ctx.client.n_calls
+    ctx.client.reset_call_counter()
 
     if n < cfg.min_cluster_size:
         ev = _build_evidence(code, idxs, ctx, rng)
@@ -538,10 +580,10 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
                                   "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
         cands = res.get("candidates") or []
         cand = cands[0] if cands else {"label": cid, "description": "", "rationale": ""}
-        return _finalize(cfg, cid, cand, n, recall=None, precision=None, discrimination=None,
+        return _finalize(ctx, cid, cand, n, recall=None, precision=None, discrimination=None,
                          stability=None, evidence=ev, alternatives=[], subthemes=None,
                          note="cluster too small for held-out verification",
-                         n_calls=ctx.client.n_calls - n_calls_before)
+                         n_calls=ctx.client.calls_since_reset())
 
     # held-out split: never shown to evidence/proposal/refine
     perm = rng.permutation(idxs)
@@ -550,7 +592,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
 
     ev = _build_evidence(code, train, ctx, rng)
     target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
-    neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
+    neighbour_texts, shown_neighbour_ids = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
 
     res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates),
                               "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
@@ -558,7 +600,8 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     candidates = res.get("candidates") or [{"label": cid, "description": "", "rationale": ""}]
 
     pos_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in holdout]
-    neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng)
+    neg_ids, neg_texts = _sample_negatives(ctx, ev["neighbour_codes"], cfg.verify_negatives, rng,
+                                           exclude=set(shown_neighbour_ids))
 
     graded = []
     for cand in candidates:
@@ -572,9 +615,9 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     stability = _stability_score(ctx, code, train, best_cand["label"], rng)
     subthemes = _maybe_subthemes(ctx, idxs, ev["spread_ratio"], rng)
 
-    return _finalize(cfg, cid, best_cand, n, recall=recall, precision=precision, discrimination=discrimination,
+    return _finalize(ctx, cid, best_cand, n, recall=recall, precision=precision, discrimination=discrimination,
                      stability=stability, evidence=ev, alternatives=alternatives, subthemes=subthemes,
-                     note=None, n_calls=ctx.client.n_calls - n_calls_before)
+                     note=None, n_calls=ctx.client.calls_since_reset())
 
 
 def _confidence_band(cfg: LabelConfig, discrimination: Optional[float], stability: Optional[float]) -> str:
@@ -587,8 +630,16 @@ def _confidence_band(cfg: LabelConfig, discrimination: Optional[float], stabilit
     return "low"
 
 
-def _finalize(cfg, cid, cand, size, *, recall, precision, discrimination, stability, evidence,
+def _finalize(ctx: _Ctx, cid, cand, size, *, recall, precision, discrimination, stability, evidence,
              alternatives, subthemes, note, n_calls) -> dict:
+    cfg = ctx.cfg
+    ev_block: Dict[str, Any] = {}
+    for key in ("core", "diverse", "boundary"):
+        ids = list(evidence.get(key, []))
+        ev_block[key] = ids
+        # carry the actual exemplar texts, not just row indices, so a human can
+        # re-check the evidence behind a label without re-joining to the frame.
+        ev_block[f"{key}_texts"] = [_clip(ctx.text_arr[i], cfg.item_chars) for i in ids]
     return {
         "cluster_id": cid,
         "label": cand.get("label", cid),
@@ -602,10 +653,23 @@ def _finalize(cfg, cid, cand, size, *, recall, precision, discrimination, stabil
         "alternatives": alternatives,
         "confusable_with": [],
         "subthemes": subthemes,
-        "evidence": {"core": evidence.get("core", []), "diverse": evidence.get("diverse", []),
-                     "boundary": evidence.get("boundary", [])},
+        "evidence": ev_block,
         "n_llm_calls": n_calls,
         "note": note,
+    }
+
+
+def _error_card(cid: str, size: int, err: str) -> dict:
+    """Full-shaped placeholder so one failed cluster never aborts the batch or
+    breaks the downstream coherence pass / dataframe / report."""
+    return {
+        "cluster_id": cid, "label": cid, "description": "", "rationale": "", "size": size,
+        "scores": {"recall": None, "precision": None, "discrimination": None,
+                   "stability": None, "confidence": "error"},
+        "alternatives": [], "confusable_with": [], "subthemes": None,
+        "evidence": {"core": [], "core_texts": [], "diverse": [], "diverse_texts": [],
+                     "boundary": [], "boundary_texts": []},
+        "n_llm_calls": 0, "note": f"labeling failed: {err}",
     }
 
 
@@ -667,12 +731,25 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
     cfg = cfg or LabelConfig()
     client = _LLMClient(cfg, llm_fn or _GATEWAY[0])
     df = df.reset_index(drop=True)
+    for col in (text_col, cluster_col):
+        if col not in df.columns:
+            raise KeyError(f"column {col!r} not found in DataFrame (have {list(df.columns)})")
+    if len(df) == 0:
+        raise ValueError("DataFrame is empty")
     text_arr = df[text_col].astype(str).to_numpy()
     if embeddings is None:
         if not embedding_col:
             raise ValueError("pass `embeddings` or `embedding_col`")
+        if embedding_col not in df.columns:
+            raise KeyError(f"embedding_col {embedding_col!r} not found in DataFrame")
         embeddings = np.stack(df[embedding_col].to_numpy())
-    emb_n = _normalize(np.asarray(embeddings, dtype=np.float32))
+    embeddings = np.asarray(embeddings, dtype=np.float32)
+    if embeddings.ndim != 2 or embeddings.shape[0] != len(df):
+        raise ValueError(f"embeddings must be 2-D aligned to df: got shape {embeddings.shape} "
+                         f"for {len(df)} rows")
+    if not np.isfinite(embeddings).all():
+        raise ValueError("embeddings contain NaN or inf")
+    emb_n = _normalize(embeddings)
 
     cats = pd.Categorical(df[cluster_col].astype(str))
     codes = cats.codes
@@ -692,13 +769,18 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
               idxs_by_code=idxs_by_code, cfg=cfg, client=client, K=K)
 
     log.info("labeling %d clusters (model=%s, workers=%d) …", K, cfg.model, cfg.workers)
+    size_of = {cid_of[c]: int(len(idxs_by_code[c])) for c in range(K)}
     scorecards: Dict[str, dict] = {}
     bar = tqdm(total=K, desc="labeling", unit="cluster") if (progress and tqdm) else None
     with ThreadPoolExecutor(max_workers=max(1, min(cfg.workers, K))) as ex:
         futs = {ex.submit(_label_one_cluster, c, cid_of[c], ctx): cid_of[c] for c in range(K)}
-        for fut in futs:
+        for fut in as_completed(futs):
             cid = futs[fut]
-            scorecards[cid] = fut.result()
+            try:
+                scorecards[cid] = fut.result()
+            except Exception as e:  # one bad cluster must not abort the batch
+                log.exception("labeling cluster %s failed", cid)
+                scorecards[cid] = _error_card(cid, size_of[cid], str(e))
             if bar:
                 bar.update(1)
     if bar:
