@@ -111,6 +111,11 @@ class LabelConfig:
     max_retries: int = 3
     backoff_base: float = 0.5
 
+    # offline mock labeler is OPT-IN: label_clusters refuses to run without a
+    # registered gateway / llm_fn unless this is explicitly set true. Prevents a
+    # misconfigured production run from silently emitting mock-quality labels.
+    allow_mock: bool = False
+
 
 _GATEWAY: List[Optional[Callable]] = [None]
 
@@ -768,7 +773,11 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
     Returns: {cluster_id: scorecard} (see module docstring for the fields).
     """
     cfg = cfg or LabelConfig()
-    client = _LLMClient(cfg, llm_fn or _GATEWAY[0])
+    resolved_fn = llm_fn or _GATEWAY[0]
+    if resolved_fn is None and not cfg.allow_mock:
+        raise ValueError(
+            "no LLM gateway registered. Call use_llm()/use_genai(fn), pass llm_fn=, or set "
+            "LabelConfig(allow_mock=True) to use the offline mock labeler (testing/demos only).")
     df = df.reset_index(drop=True)
     for col in (text_col, cluster_col):
         if col not in df.columns:
@@ -796,6 +805,7 @@ def label_clusters(df: pd.DataFrame, embeddings: Optional[np.ndarray] = None,
     if not np.isfinite(embeddings).all():
         raise ValueError("embeddings contain NaN or inf")
     emb_n = _normalize(embeddings)
+    client = _LLMClient(cfg, resolved_fn)
 
     cats = pd.Categorical(df[cluster_col].astype(str))
     codes = cats.codes
