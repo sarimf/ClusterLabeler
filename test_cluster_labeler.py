@@ -474,6 +474,64 @@ def test_breadth_prose_uses_two_focused_asks():
     assert seen["inv"] >= 1 and seen["var"] >= 1            # two focused asks happened
 
 
+def test_breadth_gap_pass_recovers_missing_axis():
+    # the gap pass shows axes-so-far + a fresh sample and asks for what's MISSING;
+    # a varying axis returned only by the gap call must end up in the breadth.
+    import json
+    df, emb = _shared_token_dataset()
+    seen = {"gap": 0}
+
+    def gw(messages, json_mode=True):
+        p = messages[-1]["content"]
+        if "axes MISSING from the lists above" in p:          # the gap prompt
+            seen["gap"] += 1
+            return json.dumps({"invariant_axes": [],
+                               "varying_axes": [{"axis": "urgency", "values": ["high", "low"],
+                                                 "open_ended": False}]})
+        if "Decompose the TARGET" in p:
+            return json.dumps({"invariant_axes": [{"axis": "objection", "value": "pricing"}],
+                               "varying_axes": [{"axis": "product", "values": ["a"], "open_ended": True}]})
+        if "EVERY member of this cluster shares" in p:
+            return json.dumps({"summary": "shared"})
+        if "range of variation across members" in p:
+            return json.dumps({"summary": "varies"})
+        if '"fits"' in p:
+            return json.dumps({"fits": [True] * 64})
+        if '"candidates"' in p:
+            return json.dumps({"candidates": [{"label": "L", "description": "D", "rationale": "R"}]})
+        return "{}"
+
+    cards = label_clusters(df, embeddings=emb, llm_fn=gw,
+                           cfg=LabelConfig(breadth_gap_passes=1, max_retries=0, request_timeout=0),
+                           progress=False, verbose=0)
+    axes = {a["axis"] for a in cards["A"]["breadth"]["varying_axes"]}
+    assert seen["gap"] >= 1                                   # gap pass ran
+    assert "urgency" in axes and "product" in axes           # missing axis recovered + original kept
+
+
+def test_breadth_gap_passes_zero_disables():
+    import json
+    df, emb = _shared_token_dataset()
+
+    def gw(messages, json_mode=True):
+        p = messages[-1]["content"]
+        assert "axes MISSING from the lists above" not in p   # gap pass must not run
+        if "Decompose the TARGET" in p:
+            return json.dumps({"invariant_axes": [{"axis": "objection", "value": "pricing"}],
+                               "varying_axes": [{"axis": "product", "values": ["a"], "open_ended": True}]})
+        if "shares" in p or "variation" in p:
+            return json.dumps({"summary": "s"})
+        if '"fits"' in p:
+            return json.dumps({"fits": [True] * 64})
+        if '"candidates"' in p:
+            return json.dumps({"candidates": [{"label": "L", "description": "D", "rationale": "R"}]})
+        return "{}"
+
+    label_clusters(df, embeddings=emb, llm_fn=gw,
+                   cfg=LabelConfig(breadth_gap_passes=0, max_retries=0, request_timeout=0),
+                   progress=False, verbose=0)
+
+
 def test_breadth_prose_off_uses_deterministic_collation_no_extra_calls():
     # breadth_prose=False must NOT issue the summary asks; falls back to collation.
     import json
@@ -511,6 +569,8 @@ if __name__ == "__main__":
     test_breadth_collations_are_descriptive()
     test_breadth_collations_in_card_and_df()
     test_breadth_prose_uses_two_focused_asks()
+    test_breadth_gap_pass_recovers_missing_axis()
+    test_breadth_gap_passes_zero_disables()
     test_breadth_prose_off_uses_deterministic_collation_no_extra_calls()
     test_verify_positives_capped_on_large_clusters()
     test_end_to_end_mock()

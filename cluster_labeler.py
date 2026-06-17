@@ -139,6 +139,9 @@ class LabelConfig:
     breadth_exemplars: int = 14              # diverse target exemplars shown to the decomposer
     breadth_max_axes: int = 8                # cap on varying axes listed
     breadth_resamples: int = 1               # >1 unions independent extractions (higher axis recall)
+    breadth_gap_passes: int = 1              # after the first extraction, show the axes found so far +
+                                             # a fresh extreme-weighted sample and ask ONLY for what's
+                                             # MISSING; union it. Repeats toward saturation; 0 disables.
     breadth_verify: bool = True              # verify invariant axes on held-out -> coherence
     breadth_prose: bool = True               # write invariant/varying summaries as LLM prose via two
                                              # focused asks (+2 calls/cluster). False -> deterministic
@@ -475,6 +478,8 @@ def _mock_response(kind: str, ctx: dict) -> dict:
         for a in ctx.get("invariant_axes", []):
             inv_words |= _tokens(str(a.get("value", "")))
         return {"fits": [len(_tokens(t) & inv_words) > 0 if inv_words else True for t in ctx["items"]]}
+    if kind == "decompose_gap":
+        return {"invariant_axes": [], "varying_axes": []}   # mock found everything in pass 1
     if kind == "invariant_summary":
         return {"summary": _describe_invariant(ctx.get("axes", []))}
     if kind == "varying_summary":
@@ -644,6 +649,22 @@ def _breadth_verify_prompt(cfg: LabelConfig, invariant_axes: List[dict], items: 
             f"For each numbered item below, does it satisfy ALL of those attributes? Judge each "
             f"independently and strictly.\nITEMS:\n{_numbered(items)}\n"
             'Return STRICT JSON: {"fits":[true,false,...]} (one entry per item, in order)')
+
+
+def _gap_prompt(cfg: LabelConfig, invariant_axes: List[dict], varying_axes: List[dict],
+                items: List[str]) -> str:
+    inv = ", ".join(f"{a.get('axis')}={a.get('value')}" for a in invariant_axes) or "(none yet)"
+    var = "; ".join(f"{a.get('axis')} ({', '.join(str(v) for v in (a.get('values') or []))})"
+                    for a in varying_axes) or "(none yet)"
+    return (_head(cfg) +
+            "We are decomposing ONE cluster into invariant axes (attributes shared by ALL members) "
+            "and varying axes (dimensions members differ on). Axes found so far:\n"
+            f"INVARIANT: {inv}\nVARYING: {var}\n\n"
+            f"Here are ADDITIONAL members, including edge cases / outliers:\n{_numbered(items)}\n\n"
+            "List ONLY axes MISSING from the lists above — new attributes shared by these members "
+            "too, or new dimensions members differ on. Return empty lists if nothing is missing.\n"
+            'Return STRICT JSON: {"invariant_axes":[{"axis":"...","value":"..."}],'
+            '"varying_axes":[{"axis":"...","values":["..."],"open_ended":false}]}')
 
 
 def _invariant_summary_prompt(cfg: LabelConfig, invariant_axes: List[dict], items: List[str]) -> str:
@@ -885,7 +906,25 @@ def _describe_varying(axes: List[dict]) -> str:
     return ("Members vary by " + "; ".join(parts) + ".") if parts else ""
 
 
-def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.random.Generator) -> dict:
+def _extreme_sample(ctx: _Ctx, member_idxs: np.ndarray, code: int, exclude: set, k: int,
+                    rng: np.random.Generator) -> List[int]:
+    """A fresh sample weighted toward the cluster's EDGES — members farthest from the
+    centroid (where missed axes hide) plus a random draw — excluding already-shown ids."""
+    pool = np.asarray([int(i) for i in member_idxs if int(i) not in exclude])
+    if len(pool) == 0:
+        return []
+    sims = ctx.emb_n[pool] @ ctx.cent[code]
+    order = np.argsort(sims)                      # ascending -> farthest from centroid first
+    n_out = min(len(pool), max(1, k // 2))
+    out = [int(i) for i in pool[order[:n_out]]]
+    remaining = [int(i) for i in pool if int(i) not in set(out)]
+    n_rand = min(len(remaining), max(0, k - len(out)))
+    rand = [int(i) for i in rng.choice(np.asarray(remaining), size=n_rand, replace=False)] if n_rand else []
+    return out + rand
+
+
+def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.random.Generator,
+                    *, member_idxs: np.ndarray, code: int) -> dict:
     """Decompose a cluster into invariant axes (shared identity, distinctive vs
     neighbours) + varying axes (the spread). Computed from a DIVERSE sample so all
     sub-modes are represented. `invariant_summary` / `varying_summary` are written as
@@ -921,6 +960,29 @@ def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.ran
         inv2, var2 = _extract([_clip(ctx.text_arr[i], cfg.item_chars) for i in ids])
         invariant = _union_axes(invariant, inv2, merge_values=False)
         varying = _union_axes(varying, var2, merge_values=True)
+
+    # GAP PASS: show the axes found so far + a FRESH, edge-weighted sample and ask ONLY
+    # for what's MISSING, then union. Higher marginal recall than blind resampling; stop
+    # early once a pass adds nothing (saturation).
+    shown = set(pool)
+    for _ in range(max(0, cfg.breadth_gap_passes)):
+        gap_ids = _extreme_sample(ctx, member_idxs, code, shown, cfg.breadth_exemplars, rng)
+        if not gap_ids:
+            break
+        shown.update(gap_ids)
+        res = ctx.client.complete(
+            _gap_prompt(cfg, invariant, varying, [_clip(ctx.text_arr[i], cfg.item_chars) for i in gap_ids]),
+            "decompose_gap", {"target_texts": [_clip(ctx.text_arr[i], cfg.item_chars) for i in gap_ids],
+                              "invariant_axes": invariant, "varying_axes": varying})
+        inv_new = [a for a in (res.get("invariant_axes") or []) if isinstance(a, dict) and a.get("axis")] \
+            if isinstance(res, dict) else []
+        var_new = [a for a in (res.get("varying_axes") or []) if isinstance(a, dict) and a.get("axis")] \
+            if isinstance(res, dict) else []
+        before = len(invariant) + len(varying)
+        invariant = _union_axes(invariant, inv_new, merge_values=False)
+        varying = _union_axes(varying, var_new, merge_values=True)
+        if len(invariant) + len(varying) == before:
+            break                                # saturation: nothing new found
 
     varying = varying[: cfg.breadth_max_axes]
     example_ids = [int(i) for i in list(ev.get("diverse", []))[:4]]
@@ -983,7 +1045,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
         target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
         neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
         say(f"  · small cluster — labeling from all {n} members, no held-out check")
-        breadth = _decompose_axes(ctx, ev, neighbour_texts, rng)
+        breadth = _decompose_axes(ctx, ev, neighbour_texts, rng, member_idxs=idxs, code=code)
         res = ctx.client.complete(
             _propose_prompt(cfg, target_texts, neighbour_texts, 1,
                             breadth["invariant_axes"], breadth["varying_axes"]),
@@ -1012,7 +1074,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     # DECOMPOSE first: invariant axes (the shared identity the label should name) +
     # varying axes (the spread). This guides PROPOSE so the label names the essence,
     # not an incidental varying attribute.
-    breadth = _decompose_axes(ctx, ev, neighbour_texts, rng)
+    breadth = _decompose_axes(ctx, ev, neighbour_texts, rng, member_idxs=train, code=code)
     say(f"  · axes: {breadth['n_invariant']} shared / {breadth['n_varying']} varying")
 
     res = ctx.client.complete(

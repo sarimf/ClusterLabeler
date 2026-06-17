@@ -332,6 +332,7 @@ n_subthemes, n_confusable, note`.
 | `breadth_exemplars` | `14` | Diverse target exemplars shown to the decomposer (capped for prompt size). |
 | `breadth_max_axes` | `8` | Cap on the number of varying axes listed. |
 | `breadth_resamples` | `1` | `>1` unions independent extractions on resampled evidence (higher axis recall, proportional cost). |
+| `breadth_gap_passes` | `1` | After the first extraction, show the axes found so far + a fresh **edge-weighted** sample (outliers) and ask only for what's **missing**, then union. Repeats toward saturation; `0` disables. The highest-ROI knob for thorough axis discovery. |
 | `breadth_verify` | `True` | Verify invariant axes on held-out members to produce `coherence`. |
 | `breadth_prose` | `True` | Write `invariant_summary`/`varying_summary` as LLM prose via two focused asks (+2 calls/cluster). `False` → deterministic collation of the axes (no extra calls). |
 
