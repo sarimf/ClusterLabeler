@@ -272,6 +272,10 @@ incidental varying attribute) and costs ≈1–2 extra LLM calls per cluster.
 discrimination, stability, coherence, confidence, n_invariant_axes, n_varying_axes, varying_axes,
 n_subthemes, n_confusable, note`.
 
+> Long text columns (`breadth_summary`, `varying_axes`, `description`) hold the full value, but
+> **pandas truncates them on display** (default `display.max_colwidth=50`). To see the whole text:
+> `pd.set_option("display.max_colwidth", None)`.
+
 ---
 
 ## All tunable parameters (`LabelConfig`)
@@ -282,7 +286,8 @@ n_subthemes, n_confusable, note`.
 | `domain_hint` | `None` | Free-text description of the corpus, injected into every prompt. Strongly recommended. |
 | `same_when` | `None` | Your definition of "same kind" (the merge rule), injected into prompts. |
 | `item_chars` | `400` | Max characters per item shown to the model (longer items are clipped). |
-| `desc_chars` | `160` | Max characters kept for each generated description. |
+| `desc_chars` | `160` | Max characters kept for each generated label description. |
+| `breadth_summary_chars` | `600` | Max characters kept for the breadth `summary` (spans several aspects, so longer than `desc_chars`). |
 
 ### Evidence shape
 | Param | Default | What it does |

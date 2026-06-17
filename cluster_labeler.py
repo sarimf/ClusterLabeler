@@ -99,6 +99,8 @@ class LabelConfig:
     same_when: Optional[str] = None          # e.g. "they describe the same underlying issue"
     item_chars: int = 400
     desc_chars: int = 160
+    breadth_summary_chars: int = 600         # breadth summary spans several aspects, so it gets
+                                             # more room than a one-line label description.
 
     # evidence shape
     n_core: int = 8                          # nearest-centroid exemplars (the "typical" member)
@@ -858,7 +860,7 @@ def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.ran
                                   "decompose", {"target_texts": texts, "neighbour_texts": neighbour_texts})
         if not isinstance(res, dict):
             return "", [], []
-        summary = _clip(res.get("summary", ""), cfg.desc_chars) if res.get("summary") else ""
+        summary = _clip(res.get("summary", ""), cfg.breadth_summary_chars) if res.get("summary") else ""
         inv = [a for a in (res.get("invariant_axes") or []) if isinstance(a, dict) and a.get("axis")]
         var = [a for a in (res.get("varying_axes") or []) if isinstance(a, dict) and a.get("axis")]
         return summary, inv, var

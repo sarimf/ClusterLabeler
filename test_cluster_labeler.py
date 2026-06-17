@@ -416,6 +416,33 @@ def test_breadth_deterministic():
         assert [v["values"] for v in ba["varying_axes"]] == [v["values"] for v in bb["varying_axes"]]
 
 
+def test_breadth_summary_not_clipped_to_desc_chars():
+    # the breadth summary must use breadth_summary_chars, not the short desc_chars,
+    # so multi-sentence summaries aren't truncated in the scorecard / dataframe.
+    import json
+    df, emb = _shared_token_dataset()
+    long_summary = "Members share a pricing objection but vary widely in product and phrasing. " * 4  # ~290 chars
+    assert len(long_summary) > LabelConfig().desc_chars
+
+    def gw(messages, json_mode=True):
+        p = messages[-1]["content"]
+        if "Decompose the TARGET" in p:
+            return json.dumps({"summary": long_summary,
+                               "invariant_axes": [{"axis": "objection", "value": "pricing"}],
+                               "varying_axes": [{"axis": "product", "values": ["a"], "open_ended": True}]})
+        if '"fits"' in p:
+            return json.dumps({"fits": [True] * 64})
+        if '"candidates"' in p:
+            return json.dumps({"candidates": [{"label": "L", "description": "D", "rationale": "R"}]})
+        return "{}"
+
+    cfg = LabelConfig(breadth_summary_chars=600, max_retries=0, request_timeout=0)
+    cards = label_clusters(df, embeddings=emb, llm_fn=gw, cfg=cfg, progress=False, verbose=0)
+    s = cards["A"]["breadth"]["summary"]
+    assert len(s) > cfg.desc_chars and s == long_summary.strip()[:600]
+    assert labels_to_dataframe(cards).set_index("cluster_id").loc["A", "breadth_summary"] == s
+
+
 def test_df_and_report_carry_breadth():
     df, emb = _shared_token_dataset()
     cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True), progress=False, verbose=0)
@@ -434,6 +461,7 @@ if __name__ == "__main__":
     test_propose_prompt_includes_axes_guidance()
     test_union_axes_dedupes_and_merges()
     test_breadth_deterministic()
+    test_breadth_summary_not_clipped_to_desc_chars()
     test_df_and_report_carry_breadth()
     test_verify_positives_capped_on_large_clusters()
     test_end_to_end_mock()
