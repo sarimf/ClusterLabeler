@@ -94,8 +94,8 @@ def test_end_to_end_mock():
         assert sc["label"]
         assert "core_texts" in sc["evidence"]          # exemplar texts are exposed
         assert "breadth" in sc                          # axis decomposition always present
-        assert set(sc["breadth"]) >= {"summary", "invariant_axes", "varying_axes",
-                                      "coherence", "n_invariant", "n_varying"}
+        assert set(sc["breadth"]) >= {"invariant_summary", "varying_summary", "invariant_axes",
+                                      "varying_axes", "coherence", "n_invariant", "n_varying"}
         assert sc["n_llm_calls"] >= 1
         assert sc["n_llm_calls"] < 60                   # per-cluster count, not the batch total
     tiny = cards["tiny"]
@@ -355,7 +355,7 @@ def test_breadth_small_cluster_has_no_coherence():
     sc = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True),
                         progress=False, verbose=0)["tiny"]
     assert sc["breadth"]["coherence"] is None            # no holdout on a size-4 cluster
-    assert set(sc["breadth"]) >= {"summary", "invariant_axes", "varying_axes"}
+    assert set(sc["breadth"]) >= {"invariant_summary", "varying_summary", "invariant_axes", "varying_axes"}
 
 
 def test_breadth_varying_axes_capped():
@@ -411,46 +411,35 @@ def test_breadth_deterministic():
     a, b = run(), run()
     for cid in a:
         ba, bb = a[cid]["breadth"], b[cid]["breadth"]
-        assert (ba["n_invariant"], ba["n_varying"], ba["summary"]) == \
-               (bb["n_invariant"], bb["n_varying"], bb["summary"])
+        assert (ba["n_invariant"], ba["n_varying"], ba["invariant_summary"], ba["varying_summary"]) == \
+               (bb["n_invariant"], bb["n_varying"], bb["invariant_summary"], bb["varying_summary"])
         assert [v["values"] for v in ba["varying_axes"]] == [v["values"] for v in bb["varying_axes"]]
 
 
-def test_breadth_summary_not_clipped_to_desc_chars():
-    # the breadth summary must use breadth_summary_chars, not the short desc_chars,
-    # so multi-sentence summaries aren't truncated in the scorecard / dataframe.
-    import json
-    df, emb = _shared_token_dataset()
-    long_summary = "Members share a pricing objection but vary widely in product and phrasing. " * 4  # ~290 chars
-    assert len(long_summary) > LabelConfig().desc_chars
-
-    def gw(messages, json_mode=True):
-        p = messages[-1]["content"]
-        if "Decompose the TARGET" in p:
-            return json.dumps({"summary": long_summary,
-                               "invariant_axes": [{"axis": "objection", "value": "pricing"}],
-                               "varying_axes": [{"axis": "product", "values": ["a"], "open_ended": True}]})
-        if '"fits"' in p:
-            return json.dumps({"fits": [True] * 64})
-        if '"candidates"' in p:
-            return json.dumps({"candidates": [{"label": "L", "description": "D", "rationale": "R"}]})
-        return "{}"
-
-    cfg = LabelConfig(breadth_summary_chars=600, max_retries=0, request_timeout=0)
-    cards = label_clusters(df, embeddings=emb, llm_fn=gw, cfg=cfg, progress=False, verbose=0)
-    s = cards["A"]["breadth"]["summary"]
-    assert len(s) > cfg.desc_chars and s == long_summary.strip()[:600]
-    assert labels_to_dataframe(cards).set_index("cluster_id").loc["A", "breadth_summary"] == s
+def test_breadth_collations_are_descriptive():
+    from cluster_labeler import _describe_invariant, _describe_varying
+    inv = _describe_invariant([{"axis": "objection", "value": "pricing"},
+                               {"axis": "sentiment", "value": "negative"}])
+    assert inv == "All members share objection (pricing), sentiment (negative)."
+    var = _describe_varying([{"axis": "product", "values": ["laptop", "monitor"], "open_ended": True},
+                             {"axis": "tone", "values": ["polite", "frustrated"]}])
+    assert var == "Members vary by product (laptop, monitor, …); tone (polite, frustrated)."
+    assert _describe_invariant([]) == "" and _describe_varying([]) == ""
 
 
-def test_df_and_report_carry_breadth():
+def test_breadth_collations_in_card_and_df():
     df, emb = _shared_token_dataset()
     cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True), progress=False, verbose=0)
-    cols = labels_to_dataframe(cards).columns
-    for c in ("breadth_summary", "n_invariant_axes", "n_varying_axes", "varying_axes", "coherence"):
-        assert c in cols
+    a = cards["A"]["breadth"]
+    assert a["invariant_summary"].startswith("All members share") and "alpha" in a["invariant_summary"]
+    assert a["varying_summary"].startswith("Members vary by")
+    dfc = labels_to_dataframe(cards).set_index("cluster_id")
+    for c in ("invariant_summary", "varying_summary", "n_invariant_axes", "n_varying_axes", "coherence"):
+        assert c in dfc.columns
+    assert "breadth_summary" not in dfc.columns and "varying_axes" not in dfc.columns
+    assert dfc.loc["A", "invariant_summary"] == a["invariant_summary"]
     rep = render_label_report(cards)
-    assert "breadth:" in rep and ("varies by" in rep or "invariant:" in rep)
+    assert "shared:" in rep and "varies:" in rep
 
 
 if __name__ == "__main__":
@@ -461,8 +450,8 @@ if __name__ == "__main__":
     test_propose_prompt_includes_axes_guidance()
     test_union_axes_dedupes_and_merges()
     test_breadth_deterministic()
-    test_breadth_summary_not_clipped_to_desc_chars()
-    test_df_and_report_carry_breadth()
+    test_breadth_collations_are_descriptive()
+    test_breadth_collations_in_card_and_df()
     test_verify_positives_capped_on_large_clusters()
     test_end_to_end_mock()
     test_fits_coercion()

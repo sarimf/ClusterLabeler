@@ -233,7 +233,7 @@ capture or route it; set `verbose=0` and use logging if you prefer.
 | `scores` | `recall`, `precision`, `specificity`, `discrimination`, `stability`, `confidence`. |
 | `alternatives` | Runner-up candidate cards with their discrimination scores. |
 | `confusable_with` | Other clusters with near-identical content (merge-review candidates). |
-| `breadth` | The axis decomposition: `summary`, `invariant_axes`, `varying_axes`, `coherence`, counts (see below). |
+| `breadth` | The axis decomposition: `invariant_summary`, `varying_summary`, `invariant_axes`, `varying_axes`, `coherence`, counts (see below). |
 | `subthemes` | If the cluster looks like two things, the named sub-groups (informational). |
 | `evidence` | `core` / `diverse` / `boundary` row indices **and** their `*_texts`. |
 | `n_llm_calls` | LLM calls spent on this cluster. |
@@ -254,7 +254,10 @@ capture or route it; set `verbose=0` and use logging if you prefer.
 
 `breadth` factors each cluster into *what stays constant* vs *what changes*:
 
-- `summary` — a prose description of the range the cluster spans (like a `description`, for breadth).
+- `invariant_summary` — a descriptive collation of the invariant axes (e.g. *"All members share
+  objection (pricing), sentiment (negative)."*), derived from the verified axes.
+- `varying_summary` — a descriptive collation of the varying axes (e.g. *"Members vary by product
+  (laptop, monitor, …); tone (polite, frustrated)."*).
 - `invariant_axes` — `[{axis, value}]` shared by (nearly) every member **and** distinctive vs
   neighbours. This is the cluster's identity, and what the label is steered to name.
 - `varying_axes` — `[{axis, values[], open_ended, example_ids}]` the dimensions members differ on,
@@ -268,13 +271,13 @@ The decomposition is computed **before** the label (so the label names the share
 incidental varying attribute) and costs ≈1–2 extra LLM calls per cluster.
 
 `labels_to_dataframe(scorecards)` flattens this to one row per cluster with columns:
-`cluster_id, label, description, breadth_summary, size, recall, precision, specificity,
-discrimination, stability, coherence, confidence, n_invariant_axes, n_varying_axes, varying_axes,
+`cluster_id, label, description, invariant_summary, varying_summary, size, recall, precision,
+specificity, discrimination, stability, coherence, confidence, n_invariant_axes, n_varying_axes,
 n_subthemes, n_confusable, note`.
 
-> Long text columns (`breadth_summary`, `varying_axes`, `description`) hold the full value, but
-> **pandas truncates them on display** (default `display.max_colwidth=50`). To see the whole text:
-> `pd.set_option("display.max_colwidth", None)`.
+> Long text columns (`invariant_summary`, `varying_summary`, `description`) hold the full value,
+> but **pandas truncates them on display** (default `display.max_colwidth=50`). To see the whole
+> text: `pd.set_option("display.max_colwidth", None)`.
 
 ---
 
@@ -287,7 +290,7 @@ n_subthemes, n_confusable, note`.
 | `same_when` | `None` | Your definition of "same kind" (the merge rule), injected into prompts. |
 | `item_chars` | `400` | Max characters per item shown to the model (longer items are clipped). |
 | `desc_chars` | `160` | Max characters kept for each generated label description. |
-| `breadth_summary_chars` | `600` | Max characters kept for the breadth `summary` (spans several aspects, so longer than `desc_chars`). |
+| `breadth_summary_chars` | `600` | Max characters kept for each breadth collation (`invariant_summary` / `varying_summary`). |
 
 ### Evidence shape
 | Param | Default | What it does |
