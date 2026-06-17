@@ -442,6 +442,64 @@ def test_breadth_collations_in_card_and_df():
     assert "shared:" in rep and "varies:" in rep
 
 
+def test_breadth_prose_uses_two_focused_asks():
+    # with breadth_prose=True the summaries come from two dedicated LLM calls.
+    import json
+    df, emb = _shared_token_dataset()
+    seen = {"inv": 0, "var": 0}
+
+    def gw(messages, json_mode=True):
+        p = messages[-1]["content"]
+        if "what EVERY member of this cluster shares" in p:
+            seen["inv"] += 1
+            return json.dumps({"summary": "SHARED PROSE about pricing."})
+        if "range of variation across members" in p:
+            seen["var"] += 1
+            return json.dumps({"summary": "VARY PROSE about products."})
+        if "Decompose the TARGET" in p:
+            return json.dumps({"invariant_axes": [{"axis": "objection", "value": "pricing"}],
+                               "varying_axes": [{"axis": "product", "values": ["a", "b"], "open_ended": True}]})
+        if '"fits"' in p:
+            return json.dumps({"fits": [True] * 64})
+        if '"candidates"' in p:
+            return json.dumps({"candidates": [{"label": "L", "description": "D", "rationale": "R"}]})
+        return "{}"
+
+    cards = label_clusters(df, embeddings=emb, llm_fn=gw,
+                           cfg=LabelConfig(breadth_prose=True, max_retries=0, request_timeout=0),
+                           progress=False, verbose=0)
+    a = cards["A"]["breadth"]
+    assert a["invariant_summary"] == "SHARED PROSE about pricing."
+    assert a["varying_summary"] == "VARY PROSE about products."
+    assert seen["inv"] >= 1 and seen["var"] >= 1            # two focused asks happened
+
+
+def test_breadth_prose_off_uses_deterministic_collation_no_extra_calls():
+    # breadth_prose=False must NOT issue the summary asks; falls back to collation.
+    import json
+    df, emb = _shared_token_dataset()
+
+    def gw(messages, json_mode=True):
+        p = messages[-1]["content"]
+        assert "what EVERY member of this cluster shares" not in p   # no prose ask
+        assert "range of variation across members" not in p
+        if "Decompose the TARGET" in p:
+            return json.dumps({"invariant_axes": [{"axis": "objection", "value": "pricing"}],
+                               "varying_axes": [{"axis": "product", "values": ["a"], "open_ended": True}]})
+        if '"fits"' in p:
+            return json.dumps({"fits": [True] * 64})
+        if '"candidates"' in p:
+            return json.dumps({"candidates": [{"label": "L", "description": "D", "rationale": "R"}]})
+        return "{}"
+
+    cards = label_clusters(df, embeddings=emb, llm_fn=gw,
+                           cfg=LabelConfig(breadth_prose=False, max_retries=0, request_timeout=0),
+                           progress=False, verbose=0)
+    a = cards["A"]["breadth"]
+    assert a["invariant_summary"] == "All members share objection (pricing)."
+    assert a["varying_summary"].startswith("Members vary by product")
+
+
 if __name__ == "__main__":
     test_use_llm_is_decorator_friendly()
     test_breadth_invariant_axes_and_coherence()
@@ -452,6 +510,8 @@ if __name__ == "__main__":
     test_breadth_deterministic()
     test_breadth_collations_are_descriptive()
     test_breadth_collations_in_card_and_df()
+    test_breadth_prose_uses_two_focused_asks()
+    test_breadth_prose_off_uses_deterministic_collation_no_extra_calls()
     test_verify_positives_capped_on_large_clusters()
     test_end_to_end_mock()
     test_fits_coercion()

@@ -140,6 +140,9 @@ class LabelConfig:
     breadth_max_axes: int = 8                # cap on varying axes listed
     breadth_resamples: int = 1               # >1 unions independent extractions (higher axis recall)
     breadth_verify: bool = True              # verify invariant axes on held-out -> coherence
+    breadth_prose: bool = True               # write invariant/varying summaries as LLM prose via two
+                                             # focused asks (+2 calls/cluster). False -> deterministic
+                                             # collation of the axes (no extra calls).
 
     # global coherence pass across all clusters' finished cards
     dedup_label_jaccard: float = 0.6         # near-identical label text -> re-differentiate
@@ -472,6 +475,10 @@ def _mock_response(kind: str, ctx: dict) -> dict:
         for a in ctx.get("invariant_axes", []):
             inv_words |= _tokens(str(a.get("value", "")))
         return {"fits": [len(_tokens(t) & inv_words) > 0 if inv_words else True for t in ctx["items"]]}
+    if kind == "invariant_summary":
+        return {"summary": _describe_invariant(ctx.get("axes", []))}
+    if kind == "varying_summary":
+        return {"summary": _describe_varying(ctx.get("axes", []))}
     if kind == "redifferentiate":
         return {"a": {"label": ctx["a_label"] + " (A)", "description": ctx["a_desc"]},
                 "b": {"label": ctx["b_label"] + " (B)", "description": ctx["b_desc"]}}
@@ -637,6 +644,27 @@ def _breadth_verify_prompt(cfg: LabelConfig, invariant_axes: List[dict], items: 
             f"For each numbered item below, does it satisfy ALL of those attributes? Judge each "
             f"independently and strictly.\nITEMS:\n{_numbered(items)}\n"
             'Return STRICT JSON: {"fits":[true,false,...]} (one entry per item, in order)')
+
+
+def _invariant_summary_prompt(cfg: LabelConfig, invariant_axes: List[dict], items: List[str]) -> str:
+    axes = ", ".join(f"{a.get('axis')}={a.get('value')}" for a in invariant_axes) or "(none)"
+    return (_head(cfg) +
+            f"These are members of ONE cluster:\n{_numbered(items)}\n\n"
+            f"They all share these attributes: {axes}.\n"
+            "In 1-2 natural sentences, describe what EVERY member of this cluster shares — its "
+            "common identity. Be specific and concrete; do not list members or hedge.\n"
+            'Return STRICT JSON: {"summary":"..."}')
+
+
+def _varying_summary_prompt(cfg: LabelConfig, varying_axes: List[dict], items: List[str]) -> str:
+    axes = "; ".join(f"{a.get('axis')} ({', '.join(str(v) for v in (a.get('values') or []))})"
+                     for a in varying_axes) or "(none)"
+    return (_head(cfg) +
+            f"These are members of ONE cluster:\n{_numbered(items)}\n\n"
+            f"They differ along these dimensions: {axes}.\n"
+            "In 1-2 natural sentences, describe the range of variation across members — how they "
+            "differ from one another. Be specific and concrete; do not list members or hedge.\n"
+            'Return STRICT JSON: {"summary":"..."}')
 
 
 def _verify_prompt(cfg: LabelConfig, label: str, description: str, items: List[str]) -> str:
@@ -860,9 +888,10 @@ def _describe_varying(axes: List[dict]) -> str:
 def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.random.Generator) -> dict:
     """Decompose a cluster into invariant axes (shared identity, distinctive vs
     neighbours) + varying axes (the spread). Computed from a DIVERSE sample so all
-    sub-modes are represented. Two descriptive collations (`invariant_summary`,
-    `varying_summary`) are derived deterministically from the axes; `coherence` is
-    filled later by verifying the invariants on held-out members."""
+    sub-modes are represented. `invariant_summary` / `varying_summary` are written as
+    natural prose via two focused LLM asks (or a deterministic collation of the axes
+    when breadth_prose is off); `coherence` is filled later by verifying the
+    invariants on held-out members."""
     cfg = ctx.cfg
     # diverse sample: prioritise sub-mode medoids, then core, then boundary; dedupe.
     pool, seen = [], set()
@@ -871,8 +900,9 @@ def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.ran
             seen.add(i)
             pool.append(int(i))
 
-    def _extract(ids: List[int]):
-        texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in ids]
+    sample_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in pool[: cfg.breadth_exemplars]]
+
+    def _extract(texts: List[str]):
         res = ctx.client.complete(_decompose_prompt(cfg, texts, neighbour_texts),
                                   "decompose", {"target_texts": texts, "neighbour_texts": neighbour_texts})
         if not isinstance(res, dict):
@@ -881,14 +911,14 @@ def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.ran
         var = [a for a in (res.get("varying_axes") or []) if isinstance(a, dict) and a.get("axis")]
         return inv, var
 
-    invariant, varying = _extract(pool[: cfg.breadth_exemplars])
+    invariant, varying = _extract(sample_texts)
     # robustness: union independent extractions on resampled evidence to catch axes
     # a single pass missed.
     for _ in range(max(0, cfg.breadth_resamples - 1)):
         if len(pool) <= cfg.breadth_exemplars:
             break
         ids = [int(i) for i in rng.choice(np.asarray(pool), size=cfg.breadth_exemplars, replace=False)]
-        inv2, var2 = _extract(ids)
+        inv2, var2 = _extract([_clip(ctx.text_arr[i], cfg.item_chars) for i in ids])
         invariant = _union_axes(invariant, inv2, merge_values=False)
         varying = _union_axes(varying, var2, merge_values=True)
 
@@ -898,8 +928,23 @@ def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.ran
         v["values"] = [str(x) for x in (v.get("values") or [])]
         v["open_ended"] = bool(v.get("open_ended", False))
         v.setdefault("example_ids", example_ids)
-    return {"invariant_summary": _clip(_describe_invariant(invariant), cfg.breadth_summary_chars),
-            "varying_summary": _clip(_describe_varying(varying), cfg.breadth_summary_chars),
+
+    # Two FOCUSED asks: one natural-prose summary of what's shared, one of how members
+    # vary. Falls back to the deterministic collation when prose is off or the model
+    # returns nothing (which is also what the offline mock yields, keeping it stable).
+    def _prose(axes: List[dict], prompt: str, kind: str, fallback: str) -> str:
+        if axes and cfg.breadth_prose:
+            res = ctx.client.complete(prompt, kind, {"axes": axes})
+            text = res.get("summary", "") if isinstance(res, dict) else ""
+            if text:
+                return _clip(text, cfg.breadth_summary_chars)
+        return _clip(fallback, cfg.breadth_summary_chars)
+
+    inv_summary = _prose(invariant, _invariant_summary_prompt(cfg, invariant, sample_texts),
+                         "invariant_summary", _describe_invariant(invariant))
+    var_summary = _prose(varying, _varying_summary_prompt(cfg, varying, sample_texts),
+                         "varying_summary", _describe_varying(varying))
+    return {"invariant_summary": inv_summary, "varying_summary": var_summary,
             "invariant_axes": invariant, "varying_axes": varying,
             "coherence": None, "n_invariant": len(invariant), "n_varying": len(varying)}
 
