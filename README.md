@@ -284,6 +284,11 @@ n_subthemes, n_confusable, note`.
 
 ## All tunable parameters (`LabelConfig`)
 
+> **Preset:** `LabelConfig.thorough(**overrides)` returns a config tuned for *exhaustive
+> variant/invariant axis discovery* (compute/token-heavy) — more sub-modes and exemplars per pass,
+> and several gap passes + resampled extractions that saturate axis discovery (stopping early once a
+> round finds nothing new). Override any field, e.g. `LabelConfig.thorough(domain_hint="...", workers=8)`.
+
 ### Prompt context
 | Param | Default | What it does |
 |---|---|---|

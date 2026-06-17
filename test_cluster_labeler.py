@@ -474,6 +474,24 @@ def test_breadth_prose_uses_two_focused_asks():
     assert seen["inv"] >= 1 and seen["var"] >= 1            # two focused asks happened
 
 
+def test_thorough_preset():
+    from cluster_labeler import LabelConfig
+    c = LabelConfig.thorough()
+    # the discovery knobs are turned up vs the defaults
+    d = LabelConfig()
+    assert c.breadth_gap_passes > d.breadth_gap_passes and c.breadth_resamples > d.breadth_resamples
+    assert c.breadth_exemplars > d.breadth_exemplars and c.breadth_max_axes > d.breadth_max_axes
+    assert c.micro_k >= c.n_diverse                       # diverse sample isn't silently capped
+    # overrides win, and unrelated defaults are preserved
+    o = LabelConfig.thorough(domain_hint="objections", breadth_gap_passes=5)
+    assert o.domain_hint == "objections" and o.breadth_gap_passes == 5 and o.allow_mock is False
+    # and it actually runs end-to-end on the mock
+    df, emb = _shared_token_dataset()
+    cards = label_clusters(df, embeddings=emb, cfg=LabelConfig.thorough(allow_mock=True),
+                           progress=False, verbose=0)
+    assert all("breadth" in sc for sc in cards.values())
+
+
 def test_breadth_gap_pass_recovers_missing_axis():
     # the gap pass shows axes-so-far + a fresh sample and asks for what's MISSING;
     # a varying axis returned only by the gap call must end up in the breadth.
@@ -569,6 +587,7 @@ if __name__ == "__main__":
     test_breadth_collations_are_descriptive()
     test_breadth_collations_in_card_and_df()
     test_breadth_prose_uses_two_focused_asks()
+    test_thorough_preset()
     test_breadth_gap_pass_recovers_missing_axis()
     test_breadth_gap_passes_zero_disables()
     test_breadth_prose_off_uses_deterministic_collation_no_extra_calls()

@@ -170,6 +170,30 @@ class LabelConfig:
     # misconfigured production run from silently emitting mock-quality labels.
     allow_mock: bool = False
 
+    @classmethod
+    def thorough(cls, **overrides) -> "LabelConfig":
+        """Preset tuned for exhaustive variant/invariant axis discovery (compute- and
+        token-heavy — use when those aren't a constraint).
+
+        It widens the evidence the decomposer sees and saturates axis discovery:
+        more sub-modes + exemplars per pass, several gap passes ("what's missing?"
+        against fresh outliers) and several independent resampled extractions, all
+        unioned. The gap/resample loops stop early once a round finds nothing new.
+
+        Pass any LabelConfig field as a keyword to override, e.g.
+        ``LabelConfig.thorough(domain_hint="...", workers=8)``.
+        """
+        base = dict(
+            micro_k=12, n_diverse=10,            # richer, more diverse first-pass sample
+            breadth_exemplars=24,                # show more members per breadth pass
+            breadth_max_axes=12,                 # don't truncate the long tail of axes
+            breadth_gap_passes=3,                # repeat "what's missing?" toward saturation
+            breadth_resamples=3,                 # union independent extractions
+            breadth_verify=True, breadth_prose=True,
+        )
+        base.update(overrides)
+        return cls(**base)
+
 
 _GATEWAY: List[Optional[Callable]] = [None]
 
