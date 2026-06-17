@@ -254,10 +254,11 @@ capture or route it; set `verbose=0` and use logging if you prefer.
 
 `breadth` factors each cluster into *what stays constant* vs *what changes*:
 
-- `invariant_summary` — a descriptive collation of the invariant axes (e.g. *"All members share
-  objection (pricing), sentiment (negative)."*), derived from the verified axes.
-- `varying_summary` — a descriptive collation of the varying axes (e.g. *"Members vary by product
-  (laptop, monitor, …); tone (polite, frustrated)."*).
+- `invariant_summary` — a natural-prose description of what every member shares (written by a
+  focused LLM ask grounded in the invariant axes; falls back to a deterministic collation like
+  *"All members share objection (pricing), sentiment (negative)."* when `breadth_prose=False`).
+- `varying_summary` — a natural-prose description of how members differ (a second focused ask
+  grounded in the varying axes; same deterministic fallback).
 - `invariant_axes` — `[{axis, value}]` shared by (nearly) every member **and** distinctive vs
   neighbours. This is the cluster's identity, and what the label is steered to name.
 - `varying_axes` — `[{axis, values[], open_ended, example_ids}]` the dimensions members differ on,
@@ -332,6 +333,7 @@ n_subthemes, n_confusable, note`.
 | `breadth_max_axes` | `8` | Cap on the number of varying axes listed. |
 | `breadth_resamples` | `1` | `>1` unions independent extractions on resampled evidence (higher axis recall, proportional cost). |
 | `breadth_verify` | `True` | Verify invariant axes on held-out members to produce `coherence`. |
+| `breadth_prose` | `True` | Write `invariant_summary`/`varying_summary` as LLM prose via two focused asks (+2 calls/cluster). `False` → deterministic collation of the axes (no extra calls). |
 
 ### Sub-theme detection (informational; superseded by breadth, retained for compat)
 | Param | Default | What it does |
