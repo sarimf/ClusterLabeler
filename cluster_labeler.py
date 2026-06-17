@@ -131,6 +131,14 @@ class LabelConfig:
     subtheme_spread_ratio: float = 1.6       # inter/intra micro-mode spread trigger
     subtheme_min_size: int = 16
 
+    # breadth: decompose each cluster into invariant axes (the shared identity the
+    # label should name) + varying axes (the spread), computed BEFORE the label and
+    # used to guide it. The invariants are then verified on held-out members.
+    breadth_exemplars: int = 14              # diverse target exemplars shown to the decomposer
+    breadth_max_axes: int = 8                # cap on varying axes listed
+    breadth_resamples: int = 1               # >1 unions independent extractions (higher axis recall)
+    breadth_verify: bool = True              # verify invariant axes on held-out -> coherence
+
     # global coherence pass across all clusters' finished cards
     dedup_label_jaccard: float = 0.6         # near-identical label text -> re-differentiate
     dedup_cent_sim: float = 0.55             # near-identical content -> flag for merge review
@@ -439,6 +447,30 @@ def _mock_response(kind: str, ctx: dict) -> dict:
         return _mock_response("propose", {**ctx, "n_out": 1})["candidates"][0]
     if kind == "subtheme":
         return {"names": [f"sub-theme {i + 1}" for i in range(len(ctx["groups"]))]}
+    if kind == "decompose":
+        # invariant = tokens shared by ALL target members and not in neighbours;
+        # varying = a couple of axes from the most distinctive non-shared tokens.
+        per_item = [_tokens(t) for t in ctx["target_texts"]]
+        shared = set.intersection(*per_item) if per_item else set()
+        neighbour_words = set()
+        for t in ctx["neighbour_texts"]:
+            neighbour_words |= _tokens(t)
+        distinctive_shared = sorted(shared - neighbour_words)
+        freq: Dict[str, int] = {}
+        for toks in per_item:
+            for w in toks:
+                if w not in shared:
+                    freq[w] = freq.get(w, 0) + 1
+        varying_vals = [w for w, _ in sorted(freq.items(), key=lambda kv: -kv[1])][:6]
+        invariant = [{"axis": "shared term", "value": v} for v in distinctive_shared[:2]]
+        varying = [{"axis": "wording", "values": varying_vals, "open_ended": True}] if varying_vals else []
+        return {"summary": "mock: members share " + (", ".join(distinctive_shared[:2]) or "little")
+                + " and vary in wording.", "invariant_axes": invariant, "varying_axes": varying}
+    if kind == "breadth_verify":
+        inv_words = set()
+        for a in ctx.get("invariant_axes", []):
+            inv_words |= _tokens(str(a.get("value", "")))
+        return {"fits": [len(_tokens(t) & inv_words) > 0 if inv_words else True for t in ctx["items"]]}
     if kind == "redifferentiate":
         return {"a": {"label": ctx["a_label"] + " (A)", "description": ctx["a_desc"]},
                 "b": {"label": ctx["b_label"] + " (B)", "description": ctx["b_desc"]}}
@@ -556,8 +588,22 @@ def _head(cfg: LabelConfig) -> str:
     return h
 
 
-def _propose_prompt(cfg: LabelConfig, target_texts: List[str], neighbour_texts: List[str], n_out: int) -> str:
+def _axes_guidance(invariant_axes: List[dict], varying_axes: List[dict]) -> str:
+    """Render the axis decomposition as guidance for the proposer (additive)."""
+    if not invariant_axes and not varying_axes:
+        return ""
+    inv = ", ".join(f"{a.get('axis')}={a.get('value')}" for a in invariant_axes) or "(none found)"
+    var = ", ".join(str(a.get("axis")) for a in varying_axes) or "(none found)"
+    return ("SHARED IDENTITY (true of EVERY target, what separates it from neighbours — name the "
+            f"label from THESE): {inv}\n"
+            f"INCIDENTAL VARIATION (differs across targets — do NOT name the label after these): {var}\n\n")
+
+
+def _propose_prompt(cfg: LabelConfig, target_texts: List[str], neighbour_texts: List[str], n_out: int,
+                    invariant_axes: Optional[List[dict]] = None,
+                    varying_axes: Optional[List[dict]] = None) -> str:
     return (_head(cfg) +
+            _axes_guidance(invariant_axes or [], varying_axes or []) +
             f"TARGET ITEMS (core + sub-modes of one cluster):\n{_numbered(target_texts)}\n\n"
             f"NEIGHBOUR ITEMS (sampled from the nearest OTHER clusters - what the target is NOT):\n"
             f"{_numbered(neighbour_texts)}\n\n"
@@ -567,6 +613,30 @@ def _propose_prompt(cfg: LabelConfig, target_texts: List[str], neighbour_texts: 
             "from each other in wording or angle, not be paraphrases.\n"
             'Return STRICT JSON: {"candidates":[{"label":"<=8 words","description":"<=25 words",'
             '"rationale":"<=20 words, what separates target from neighbours"}]}')
+
+
+def _decompose_prompt(cfg: LabelConfig, target_texts: List[str], neighbour_texts: List[str]) -> str:
+    return (_head(cfg) +
+            f"TARGET MEMBERS (a diverse sample of ONE cluster):\n{_numbered(target_texts)}\n\n"
+            f"NEIGHBOUR MEMBERS (from the nearest OTHER clusters):\n{_numbered(neighbour_texts)}\n\n"
+            "Decompose the TARGET cluster into the dimensions on which its members AGREE vs DIFFER:\n"
+            "(a) summary: 1-2 sentences describing the range the target members span.\n"
+            "(b) invariant_axes: attributes shared by EVERY target member AND that separate them "
+            "from the neighbours (the cluster's shared identity). Each as {axis, value}.\n"
+            "(c) varying_axes: attributes that DIFFER across target members. Each as {axis, values "
+            "(the distinct values you observe), open_ended (true if the list is illustrative, not "
+            "exhaustive)}.\n"
+            'Return STRICT JSON: {"summary":"...","invariant_axes":[{"axis":"...","value":"..."}],'
+            '"varying_axes":[{"axis":"...","values":["..."],"open_ended":false}]}')
+
+
+def _breadth_verify_prompt(cfg: LabelConfig, invariant_axes: List[dict], items: List[str]) -> str:
+    axes = "; ".join(f"{a.get('axis')}: {a.get('value')}" for a in invariant_axes) or "(none)"
+    return (_head(cfg) +
+            f"A cluster's SHARED IDENTITY is defined by these invariant attributes:\n{axes}\n\n"
+            f"For each numbered item below, does it satisfy ALL of those attributes? Judge each "
+            f"independently and strictly.\nITEMS:\n{_numbered(items)}\n"
+            'Return STRICT JSON: {"fits":[true,false,...]} (one entry per item, in order)')
 
 
 def _verify_prompt(cfg: LabelConfig, label: str, description: str, items: List[str]) -> str:
@@ -747,6 +817,86 @@ def _maybe_subthemes(ctx: _Ctx, idxs: np.ndarray, spread_ratio: float, rng: np.r
 
 
 # ===========================================================================
+# breadth: invariant vs varying axes (computed BEFORE the label, used to guide it)
+# ===========================================================================
+def _union_axes(a: List[dict], b: List[dict], *, merge_values: bool) -> List[dict]:
+    """Union two axis lists, deduping by lowercased axis name. For varying axes,
+    merge their value sets; for invariant axes, keep the first value seen."""
+    by_name: Dict[str, dict] = {}
+    order: List[str] = []
+    for ax in list(a) + list(b):
+        if not isinstance(ax, dict) or not ax.get("axis"):
+            continue
+        key = str(ax["axis"]).strip().lower()
+        if key not in by_name:
+            by_name[key] = dict(ax)
+            order.append(key)
+        elif merge_values:
+            existing = [str(x) for x in (by_name[key].get("values") or [])]
+            new = [str(x) for x in (ax.get("values") or [])]
+            by_name[key]["values"] = list(dict.fromkeys(existing + new))
+            by_name[key]["open_ended"] = bool(by_name[key].get("open_ended")) or bool(ax.get("open_ended"))
+    return [by_name[k] for k in order]
+
+
+def _decompose_axes(ctx: _Ctx, ev: dict, neighbour_texts: List[str], rng: np.random.Generator) -> dict:
+    """Decompose a cluster into invariant axes (shared identity, distinctive vs
+    neighbours) + varying axes (the spread) + a prose summary. Computed from a
+    DIVERSE sample so all sub-modes are represented. `coherence` is filled later
+    by verifying the invariants on held-out members."""
+    cfg = ctx.cfg
+    # diverse sample: prioritise sub-mode medoids, then core, then boundary; dedupe.
+    pool, seen = [], set()
+    for i in list(ev.get("diverse", [])) + list(ev.get("core", [])) + list(ev.get("boundary", [])):
+        if i not in seen:
+            seen.add(i)
+            pool.append(int(i))
+
+    def _extract(ids: List[int]):
+        texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in ids]
+        res = ctx.client.complete(_decompose_prompt(cfg, texts, neighbour_texts),
+                                  "decompose", {"target_texts": texts, "neighbour_texts": neighbour_texts})
+        if not isinstance(res, dict):
+            return "", [], []
+        summary = _clip(res.get("summary", ""), cfg.desc_chars) if res.get("summary") else ""
+        inv = [a for a in (res.get("invariant_axes") or []) if isinstance(a, dict) and a.get("axis")]
+        var = [a for a in (res.get("varying_axes") or []) if isinstance(a, dict) and a.get("axis")]
+        return summary, inv, var
+
+    summary, invariant, varying = _extract(pool[: cfg.breadth_exemplars])
+    # robustness: union independent extractions on resampled evidence to catch axes
+    # a single pass missed.
+    for _ in range(max(0, cfg.breadth_resamples - 1)):
+        if len(pool) <= cfg.breadth_exemplars:
+            break
+        ids = [int(i) for i in rng.choice(np.asarray(pool), size=cfg.breadth_exemplars, replace=False)]
+        s2, inv2, var2 = _extract(ids)
+        invariant = _union_axes(invariant, inv2, merge_values=False)
+        varying = _union_axes(varying, var2, merge_values=True)
+        summary = summary or s2
+
+    varying = varying[: cfg.breadth_max_axes]
+    example_ids = [int(i) for i in list(ev.get("diverse", []))[:4]]
+    for v in varying:
+        v["values"] = [str(x) for x in (v.get("values") or [])]
+        v["open_ended"] = bool(v.get("open_ended", False))
+        v.setdefault("example_ids", example_ids)
+    return {"summary": summary, "invariant_axes": invariant, "varying_axes": varying,
+            "coherence": None, "n_invariant": len(invariant), "n_varying": len(varying)}
+
+
+def _breadth_coherence(ctx: _Ctx, invariant_axes: List[dict], holdout_texts: List[str]) -> Optional[float]:
+    """Fraction of held-out members consistent with ALL invariant axes."""
+    cfg = ctx.cfg
+    if not (cfg.breadth_verify and invariant_axes and holdout_texts):
+        return None
+    res = ctx.client.complete(_breadth_verify_prompt(cfg, invariant_axes, holdout_texts),
+                              "breadth_verify", {"invariant_axes": invariant_axes, "items": holdout_texts})
+    fits = _fits_of(res, len(holdout_texts))
+    return sum(1 for f in fits if f) / len(fits) if fits else None
+
+
+# ===========================================================================
 # per-cluster pipeline
 # ===========================================================================
 def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
@@ -769,12 +919,15 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
         target_texts = [_clip(ctx.text_arr[i], cfg.item_chars) for i in (ev["core"] + ev["diverse"] + ev["boundary"])]
         neighbour_texts, _ = _neighbour_exemplars(ctx, ev["neighbour_codes"], cfg.n_contrast_items, rng)
         say(f"  · small cluster — labeling from all {n} members, no held-out check")
-        res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, 1),
-                                  "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
+        breadth = _decompose_axes(ctx, ev, neighbour_texts, rng)
+        res = ctx.client.complete(
+            _propose_prompt(cfg, target_texts, neighbour_texts, 1,
+                            breadth["invariant_axes"], breadth["varying_axes"]),
+            "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts, "n_out": 1})
         cands = _candidates_of(res)
         cand = cands[0] if cands else {"label": cid, "description": "", "rationale": ""}
         card = _finalize(ctx, cid, cand, n, metrics=dict(_NO_METRICS),
-                         stability=None, evidence=ev, alternatives=[], subthemes=None,
+                         stability=None, evidence=ev, alternatives=[], subthemes=None, breadth=breadth,
                          note="cluster too small for held-out verification",
                          n_calls=ctx.client.calls_since_reset())
         card["_log"] = log_lines
@@ -792,9 +945,17 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
         f"{len(ev['boundary'])} boundary; {len(holdout)} held out; "
         f"{len(ev['neighbour_codes'])} contrast clusters")
 
-    res = ctx.client.complete(_propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates),
-                              "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
-                                          "n_out": cfg.n_candidates})
+    # DECOMPOSE first: invariant axes (the shared identity the label should name) +
+    # varying axes (the spread). This guides PROPOSE so the label names the essence,
+    # not an incidental varying attribute.
+    breadth = _decompose_axes(ctx, ev, neighbour_texts, rng)
+    say(f"  · axes: {breadth['n_invariant']} shared / {breadth['n_varying']} varying")
+
+    res = ctx.client.complete(
+        _propose_prompt(cfg, target_texts, neighbour_texts, cfg.n_candidates,
+                        breadth["invariant_axes"], breadth["varying_axes"]),
+        "propose", {"target_texts": target_texts, "neighbour_texts": neighbour_texts,
+                    "n_out": cfg.n_candidates})
     candidates = _candidates_of(res) or [{"label": cid, "description": "", "rationale": ""}]
     say(f"  · proposed {len(candidates)} candidate(s): "
         f"{', '.join(repr(c.get('label', '')) for c in candidates[:4])}")
@@ -830,6 +991,12 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
     if subthemes:
         say(f"  · sub-themes detected: {', '.join(repr(s['name']) for s in subthemes)}")
 
+    # verify the invariant axes on held-out members -> coherence (low = the cluster
+    # lacks a real shared identity).
+    breadth["coherence"] = _breadth_coherence(ctx, breadth["invariant_axes"], pos_texts)
+    say(f"  · breadth: {breadth['n_invariant']} invariant / {breadth['n_varying']} varying axes, "
+        f"coherence {_fmt_score(breadth['coherence'])}")
+
     # When a cluster has no siblings (K == 1) there are no negatives, so precision
     # and specificity are unmeasured and discrimination is recall-only — flag it
     # rather than let a recall-only score masquerade as full discrimination.
@@ -838,7 +1005,7 @@ def _label_one_cluster(code: int, cid: str, ctx: _Ctx) -> dict:
 
     card = _finalize(ctx, cid, best_cand, n, metrics=best_metrics,
                      stability=stability, evidence=ev, alternatives=alternatives, subthemes=subthemes,
-                     note=note, n_calls=ctx.client.calls_since_reset())
+                     breadth=breadth, note=note, n_calls=ctx.client.calls_since_reset())
     card["_log"] = log_lines
     return card
 
@@ -863,8 +1030,13 @@ def _confidence_band(cfg: LabelConfig, metrics: dict, stability: Optional[float]
     return "low"
 
 
+def _empty_breadth() -> dict:
+    return {"summary": "", "invariant_axes": [], "varying_axes": [],
+            "coherence": None, "n_invariant": 0, "n_varying": 0}
+
+
 def _finalize(ctx: _Ctx, cid, cand, size, *, metrics, stability, evidence,
-             alternatives, subthemes, note, n_calls) -> dict:
+             alternatives, subthemes, note, n_calls, breadth=None) -> dict:
     cfg = ctx.cfg
     ev_block: Dict[str, Any] = {}
     for key in ("core", "diverse", "boundary"):
@@ -887,6 +1059,7 @@ def _finalize(ctx: _Ctx, cid, cand, size, *, metrics, stability, evidence,
         "alternatives": alternatives,
         "confusable_with": [],
         "subthemes": subthemes,
+        "breadth": breadth or _empty_breadth(),
         "evidence": ev_block,
         "n_llm_calls": n_calls,
         "note": note,
@@ -900,7 +1073,7 @@ def _error_card(cid: str, size: int, err: str) -> dict:
         "cluster_id": cid, "label": cid, "description": "", "rationale": "", "size": size,
         "scores": {"recall": None, "precision": None, "specificity": None,
                    "discrimination": None, "stability": None, "confidence": "error"},
-        "alternatives": [], "confusable_with": [], "subthemes": None,
+        "alternatives": [], "confusable_with": [], "subthemes": None, "breadth": _empty_breadth(),
         "evidence": {"core": [], "core_texts": [], "diverse": [], "diverse_texts": [],
                      "boundary": [], "boundary_texts": []},
         "n_llm_calls": 0, "note": f"labeling failed: {err}",
@@ -1092,8 +1265,10 @@ def _cluster_line(sc: dict, done: int, total: int) -> str:
             f"prec={_fmt_score(s.get('precision'))} spec={_fmt_score(s.get('specificity'))} "
             f"stab={_fmt_score(s['stability'])}  calls={sc['n_llm_calls']}")
     extra = ""
-    if sc.get("subthemes"):
-        extra += f"  [{len(sc['subthemes'])} sub-themes]"
+    b = sc.get("breadth") or {}
+    if b.get("n_varying"):
+        extra += f"  [axes {b.get('n_invariant', 0)} shared/{b['n_varying']} varying"
+        extra += f", coherence {_fmt_score(b.get('coherence'))}]" if b.get("coherence") is not None else "]"
     if sc.get("note"):
         extra += f"  ({sc['note']})"
     return head + tail + extra
@@ -1106,6 +1281,9 @@ def _summary_lines(scorecards: Dict[str, dict], tally: Dict[str, int],
     for sc in scorecards.values():
         counts[sc["scores"]["confidence"]] = counts.get(sc["scores"]["confidence"], 0) + 1
     n_sub = sum(1 for sc in scorecards.values() if sc.get("subthemes"))
+    cohs = [sc.get("breadth", {}).get("coherence") for sc in scorecards.values()]
+    cohs = [c for c in cohs if c is not None]
+    n_low_coh = sum(1 for c in cohs if c < 0.7)
     lines = [
         f"cluster_labeler: done — {len(scorecards)} clusters in {elapsed:.1f}s, "
         f"{client.n_calls} LLM calls ({client.n_empty} empty)",
@@ -1113,6 +1291,8 @@ def _summary_lines(scorecards: Dict[str, dict], tally: Dict[str, int],
         f"  flags: {n_sub} with sub-themes, {tally['confusable_pairs']} confusable pairs, "
         f"{tally['redifferentiated']} re-differentiated",
     ]
+    if cohs:
+        lines.append(f"  breadth: mean coherence {np.mean(cohs):.2f}, {n_low_coh} low-coherence clusters")
     return "\n".join(lines)
 
 
@@ -1120,10 +1300,18 @@ def labels_to_dataframe(scorecards: Dict[str, dict]) -> pd.DataFrame:
     rows = []
     for cid, sc in scorecards.items():
         sco = sc["scores"]
+        b = sc.get("breadth") or {}
+        varying = "; ".join(
+            f"{a.get('axis')}: {'/'.join(str(x) for x in (a.get('values') or []))}"
+            for a in b.get("varying_axes", []))
         rows.append({"cluster_id": cid, "label": sc["label"], "description": sc["description"],
+                     "breadth_summary": b.get("summary", ""),
                      "size": sc["size"], "recall": sco["recall"], "precision": sco["precision"],
                      "specificity": sco.get("specificity"), "discrimination": sco["discrimination"],
-                     "stability": sco["stability"], "confidence": sco["confidence"],
+                     "stability": sco["stability"], "coherence": b.get("coherence"),
+                     "confidence": sco["confidence"],
+                     "n_invariant_axes": b.get("n_invariant", 0), "n_varying_axes": b.get("n_varying", 0),
+                     "varying_axes": varying,
                      "n_subthemes": len(sc["subthemes"] or []),
                      "n_confusable": len(sc["confusable_with"]), "note": sc["note"]})
     return pd.DataFrame(rows)
@@ -1143,6 +1331,17 @@ def render_label_report(scorecards: Dict[str, dict]) -> str:
                      f"specificity {_fmt(sco.get('specificity'))}")
         if sc["description"]:
             lines.append(f"   {sc['description']}")
+        b = sc.get("breadth") or {}
+        if b.get("summary"):
+            lines.append(f"   breadth: {b['summary']}"
+                         + (f" (coherence {_fmt(b.get('coherence'))})" if b.get("coherence") is not None else ""))
+        if b.get("invariant_axes"):
+            inv = ", ".join(f"{a.get('axis')}={a.get('value')}" for a in b["invariant_axes"])
+            lines.append(f"   invariant: {inv}")
+        for a in b.get("varying_axes", []):
+            vals = ", ".join(str(x) for x in (a.get("values") or []))
+            tail = " (+ more)" if a.get("open_ended") else ""
+            lines.append(f"   varies by {a.get('axis')}: {{{vals}}}{tail}")
         if sc["note"]:
             lines.append(f"   note: {sc['note']}")
         if sc["subthemes"]:

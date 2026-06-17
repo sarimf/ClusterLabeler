@@ -93,8 +93,11 @@ def test_end_to_end_mock():
     for cid, sc in cards.items():
         assert sc["label"]
         assert "core_texts" in sc["evidence"]          # exemplar texts are exposed
+        assert "breadth" in sc                          # axis decomposition always present
+        assert set(sc["breadth"]) >= {"summary", "invariant_axes", "varying_axes",
+                                      "coherence", "n_invariant", "n_varying"}
         assert sc["n_llm_calls"] >= 1
-        assert sc["n_llm_calls"] < 50                   # per-cluster count, not the batch total
+        assert sc["n_llm_calls"] < 60                   # per-cluster count, not the batch total
     tiny = cards["tiny"]
     assert tiny["scores"]["confidence"] == "unverified"
     assert "too small" in tiny["note"]
@@ -318,8 +321,120 @@ def test_timeout_disabled_passes_through():
         pass
 
 
+def _shared_token_dataset(shared="alpha", n_per=40):
+    # every member of cluster A contains `shared` plus varying words, so the mock's
+    # decompose finds an invariant axis (=> coherence is exercised).
+    rng = np.random.default_rng(3)
+    varyA = "laptop monitor warranty dock keyboard mouse".split()
+    centers = rng.normal(size=(2, 12))
+    texts, embs, cids = [], [], []
+    for _ in range(n_per):
+        texts.append(shared + " " + " ".join(rng.choice(varyA, 3)))
+        embs.append(centers[0] + rng.normal(scale=0.2, size=12)); cids.append("A")
+    for _ in range(30):
+        texts.append("beta " + " ".join(rng.choice(["login", "reset", "password"], 3)))
+        embs.append(centers[1] + rng.normal(scale=0.2, size=12)); cids.append("B")
+    df = pd.DataFrame({"text": texts, "cluster_id": cids})
+    return df, np.array(embs, dtype=np.float32)
+
+
+def test_breadth_invariant_axes_and_coherence():
+    df, emb = _shared_token_dataset()
+    cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True), progress=False, verbose=0)
+    a = cards["A"]["breadth"]
+    assert a["n_invariant"] >= 1                         # mock finds the shared "alpha" token
+    assert a["invariant_axes"][0]["value"] == "alpha"
+    assert a["coherence"] is not None and 0.0 <= a["coherence"] <= 1.0
+    assert a["coherence"] >= 0.9                         # held-out members all contain "alpha"
+    # varying axis values are present and stringified
+    assert a["n_varying"] >= 1 and all(isinstance(x, str) for x in a["varying_axes"][0]["values"])
+
+
+def test_breadth_small_cluster_has_no_coherence():
+    df, emb, _ = _toy_dataset()
+    sc = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True),
+                        progress=False, verbose=0)["tiny"]
+    assert sc["breadth"]["coherence"] is None            # no holdout on a size-4 cluster
+    assert set(sc["breadth"]) >= {"summary", "invariant_axes", "varying_axes"}
+
+
+def test_breadth_varying_axes_capped():
+    import json
+    df, emb, _ = _toy_dataset()
+
+    def gw(messages, json_mode=True):
+        p = messages[-1]["content"]
+        if "Decompose the TARGET" in p:
+            return json.dumps({"summary": "s", "invariant_axes": [{"axis": "k", "value": "v"}],
+                               "varying_axes": [{"axis": f"ax{i}", "values": ["a", "b"],
+                                                 "open_ended": False} for i in range(20)]})
+        if '"fits"' in p:
+            return json.dumps({"fits": [True] * 64})
+        if '"candidates"' in p:
+            return json.dumps({"candidates": [{"label": "L", "description": "D", "rationale": "R"}]})
+        return "{}"
+
+    cards = label_clusters(df, embeddings=emb, llm_fn=gw,
+                           cfg=LabelConfig(breadth_max_axes=5, max_retries=0, request_timeout=0),
+                           progress=False, verbose=0)
+    for sc in cards.values():
+        assert sc["breadth"]["n_varying"] <= 5
+
+
+def test_propose_prompt_includes_axes_guidance():
+    from cluster_labeler import _propose_prompt
+    p = _propose_prompt(LabelConfig(), ["t1"], ["n1"], 2,
+                        [{"axis": "objection", "value": "pricing"}],
+                        [{"axis": "product", "values": ["laptop", "monitor"]}])
+    assert "SHARED IDENTITY" in p and "objection=pricing" in p
+    assert "INCIDENTAL VARIATION" in p and "product" in p
+    # additive: with no axes, the guidance block is absent
+    assert "SHARED IDENTITY" not in _propose_prompt(LabelConfig(), ["t1"], ["n1"], 2)
+
+
+def test_union_axes_dedupes_and_merges():
+    from cluster_labeler import _union_axes
+    a = [{"axis": "Product", "values": ["laptop"], "open_ended": False}]
+    b = [{"axis": "product", "values": ["monitor"], "open_ended": True},
+         {"axis": "tone", "values": ["angry"]}]
+    out = _union_axes(a, b, merge_values=True)
+    names = [x["axis"] for x in out]
+    assert names == ["Product", "tone"]                 # deduped by lowercased name, order kept
+    assert out[0]["values"] == ["laptop", "monitor"] and out[0]["open_ended"] is True
+
+
+def test_breadth_deterministic():
+    df, emb = _shared_token_dataset()
+    def run():
+        return label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True, workers=3),
+                              progress=False, verbose=0)
+    a, b = run(), run()
+    for cid in a:
+        ba, bb = a[cid]["breadth"], b[cid]["breadth"]
+        assert (ba["n_invariant"], ba["n_varying"], ba["summary"]) == \
+               (bb["n_invariant"], bb["n_varying"], bb["summary"])
+        assert [v["values"] for v in ba["varying_axes"]] == [v["values"] for v in bb["varying_axes"]]
+
+
+def test_df_and_report_carry_breadth():
+    df, emb = _shared_token_dataset()
+    cards = label_clusters(df, embeddings=emb, cfg=LabelConfig(allow_mock=True), progress=False, verbose=0)
+    cols = labels_to_dataframe(cards).columns
+    for c in ("breadth_summary", "n_invariant_axes", "n_varying_axes", "varying_axes", "coherence"):
+        assert c in cols
+    rep = render_label_report(cards)
+    assert "breadth:" in rep and ("varies by" in rep or "invariant:" in rep)
+
+
 if __name__ == "__main__":
     test_use_llm_is_decorator_friendly()
+    test_breadth_invariant_axes_and_coherence()
+    test_breadth_small_cluster_has_no_coherence()
+    test_breadth_varying_axes_capped()
+    test_propose_prompt_includes_axes_guidance()
+    test_union_axes_dedupes_and_merges()
+    test_breadth_deterministic()
+    test_df_and_report_carry_breadth()
     test_verify_positives_capped_on_large_clusters()
     test_end_to_end_mock()
     test_fits_coercion()

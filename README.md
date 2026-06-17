@@ -13,15 +13,21 @@ label the way you'd build and test a classifier:
 
 1. **Evidence** — core (typical) + diverse (sub-modes) + boundary (where this cluster blurs into
    its nearest neighbour) + contrast samples from neighbouring clusters ("what this is *not*").
-2. **Propose** — several candidate cards, each required to be true of the target *and false of the
-   neighbours* (contrastive, not just descriptive).
-3. **Verify** — score each candidate as a classifier on **held-out** items it never saw:
-   recall, precision, specificity, and discrimination (balanced accuracy).
-4. **Refine** — feed the best candidate's false negatives/positives back, ask for a revision,
+2. **Decompose** — split the cluster into **invariant axes** (the attributes every member shares
+   *and* that separate it from neighbours — its shared identity) and **varying axes** (the
+   dimensions members differ on). Done *before* the label so it names the shared essence, not an
+   incidental varying attribute.
+3. **Propose** — several candidate cards, each required to be true of the target *and false of the
+   neighbours* (contrastive, not just descriptive), guided by the invariant/varying axes.
+4. **Verify** — score each candidate as a classifier on **held-out** items it never saw:
+   recall, precision, specificity, and discrimination (balanced accuracy). The invariant axes are
+   also checked against held-out members to yield a **coherence** score (low = the cluster lacks a
+   real shared identity).
+5. **Refine** — feed the best candidate's false negatives/positives back, ask for a revision,
    repeat until it clears the bar or the iteration budget runs out.
-5. **Stability** — resample the evidence and re-propose; a label that survives resampling is
+6. **Stability** — resample the evidence and re-propose; a label that survives resampling is
    trustworthy, one that flips means the cluster itself is ill-defined.
-6. **Sub-themes + global coherence** — flag clusters that look like two things, and flag pairs of
+7. **Sub-themes + global coherence** — flag clusters that look like two things, and flag pairs of
    clusters whose labels collide (re-differentiated) or whose content overlaps (flagged for merge
    review).
 
@@ -227,6 +233,7 @@ capture or route it; set `verbose=0` and use logging if you prefer.
 | `scores` | `recall`, `precision`, `specificity`, `discrimination`, `stability`, `confidence`. |
 | `alternatives` | Runner-up candidate cards with their discrimination scores. |
 | `confusable_with` | Other clusters with near-identical content (merge-review candidates). |
+| `breadth` | The axis decomposition: `summary`, `invariant_axes`, `varying_axes`, `coherence`, counts (see below). |
 | `subthemes` | If the cluster looks like two things, the named sub-groups (informational). |
 | `evidence` | `core` / `diverse` / `boundary` row indices **and** their `*_texts`. |
 | `n_llm_calls` | LLM calls spent on this cluster. |
@@ -243,9 +250,27 @@ capture or route it; set `verbose=0` and use logging if you prefer.
   bar to clear *and* specificity to have been measured (a cluster with no siblings to reject
   cannot earn `high`).
 
+### Breadth — axes of variation vs invariance
+
+`breadth` factors each cluster into *what stays constant* vs *what changes*:
+
+- `summary` — a prose description of the range the cluster spans (like a `description`, for breadth).
+- `invariant_axes` — `[{axis, value}]` shared by (nearly) every member **and** distinctive vs
+  neighbours. This is the cluster's identity, and what the label is steered to name.
+- `varying_axes` — `[{axis, values[], open_ended, example_ids}]` the dimensions members differ on,
+  with the observed value range (`open_ended=true` means the list is illustrative, not exhaustive).
+- `coherence` — share of held-out members consistent with **all** invariant axes (`None` when not
+  verified / no holdout). Low coherence ⇒ the cluster mixes things that don't share an identity — a
+  quality signal complementing `discrimination`.
+- `n_invariant`, `n_varying` — counts.
+
+The decomposition is computed **before** the label (so the label names the shared identity, not an
+incidental varying attribute) and costs ≈1–2 extra LLM calls per cluster.
+
 `labels_to_dataframe(scorecards)` flattens this to one row per cluster with columns:
-`cluster_id, label, description, size, recall, precision, specificity, discrimination,
-stability, confidence, n_subthemes, n_confusable, note`.
+`cluster_id, label, description, breadth_summary, size, recall, precision, specificity,
+discrimination, stability, coherence, confidence, n_invariant_axes, n_varying_axes, varying_axes,
+n_subthemes, n_confusable, note`.
 
 ---
 
@@ -292,7 +317,15 @@ stability, confidence, n_subthemes, n_confusable, note`.
 | `stability_resamples` | `2` | Evidence resamples used to test label stability (`0` disables → stability `None`). |
 | `stability_min_jaccard` | `0.34` | Min label-token overlap across resamples to count as stable for "high". |
 
-### Sub-theme detection (informational)
+### Breadth (axes of variation vs invariance)
+| Param | Default | What it does |
+|---|---|---|
+| `breadth_exemplars` | `14` | Diverse target exemplars shown to the decomposer (capped for prompt size). |
+| `breadth_max_axes` | `8` | Cap on the number of varying axes listed. |
+| `breadth_resamples` | `1` | `>1` unions independent extractions on resampled evidence (higher axis recall, proportional cost). |
+| `breadth_verify` | `True` | Verify invariant axes on held-out members to produce `coherence`. |
+
+### Sub-theme detection (informational; superseded by breadth, retained for compat)
 | Param | Default | What it does |
 |---|---|---|
 | `subtheme_spread_ratio` | `1.6` | Inter/intra micro-mode spread that triggers sub-theme splitting. |
